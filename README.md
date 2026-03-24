@@ -11,3 +11,10 @@ If using something like VS Code, then use the Cursor Rules Settings:
 - go to General > Rules for AI,
 - and paste the contents of your CLAUDE.md there.
 This applies them to every single chat and terminal command regardless of the folder.
+
+** Example **
+Here is an example of creating a symbolic link in your project's directory.
+
+```bash
+ln -s <cursor-config repo location>/CLAUDE.md <project dir>/CLAUDE.md 
+```

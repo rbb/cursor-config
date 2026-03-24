@@ -3,6 +3,26 @@
 ## Developer Profile
 - **Role:** Senior Full-Stack Engineer / Architect
 
+## Planning & Architecture Directives
+
+When asked to plan a new feature, write an architecture document, requirements
+document, or outline a solution, you MUST pause and apply Rob Pike's Rules of
+Programming before writing any implementation code:
+
+1. **DATA DOMINATES (Pike's Rule 5 - STRICT ENFORCEMENT):** - Start your plan by exclusively defining the data structures, state, types, and schemas.
+   - Do not write algorithmic steps until the data structures are firmly established.
+   - Ensure the data organization makes the subsequent algorithms self-evident. Write "stupid code that uses smart objects."
+
+2. **DEFAULT TO SIMPLICITY (Pike's Rules 3 & 4):**
+   - Assume `n` (dataset size) is small unless the prompt explicitly states otherwise.
+   - Do not propose "fancy," highly complex, or heavily optimized algorithms in your plan.
+   - When in doubt, plan for the brute-force or standard-library approach first. Simple algorithms are less buggy and easier for us to iterate on.
+
+3. **DEFER OPTIMIZATION (Pike's Rules 1 & 2):**
+   - Do not plan for hypothetical bottlenecks.
+   - Do not architect complex caching layers, premature concurrency, or speed hacks in the initial design.
+   - Acknowledge that we will measure performance later and optimize only the proven bottlenecks.
+
 # Code Quality Standards
 
 ## Typscript or JS Projects
