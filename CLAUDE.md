@@ -51,6 +51,8 @@ Programming before writing any implementation code:
 - Comments: Use # (hash + space). Keep lines under 72 characters
 - Use PEP 484 (Type Hinting)
 - All files and functions should have docstrings. Use tripe double quotes (""").
+- For --xxx, --no-xxxx style options use BooleanOptionalAction. Default should be
+  set to either True or False (depending on requested behavior).
 
 ## Git Commit Message Requirements
 - The Subject Line:
