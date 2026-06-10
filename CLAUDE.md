@@ -23,6 +23,8 @@ Programming before writing any implementation code:
    - Do not architect complex caching layers, premature concurrency, or speed hacks in the initial design.
    - Acknowledge that we will measure performance later and optimize only the proven bottlenecks.
 
+Use **project specific plan files** (project_dir/.cursor/plans/), not global ones ($HOME/.cursor/plans/).
+
 # Code Quality Standards
 
 ## Typscript or JS Projects
@@ -54,13 +56,6 @@ Programming before writing any implementation code:
 - For --xxx, --no-xxxx style options use BooleanOptionalAction. Default should be
   set to either True or False (depending on requested behavior).
 
-## Git Commit Message Requirements
-- The Subject Line:
-   - The first line should be a concise summary of the change.
-   - Target: 50 Characters or less
-   - Hard Limit: 72 characters or less
-- The Body:
-   - Hard Limit: 72 characters or less
 
 ## Markdown Style Guide
 
@@ -125,7 +120,8 @@ and non-beads projects.
     1. **Stop iterating:** No more "nice-to-have" refactors or architectural pivots.
     2. **Finalize state:** Ensure all exported functions have proper types and error handling.
     3. **Cleanup:** Remove any `console.log`, TODO comments, debug print statements, or unused imports introduced during the session.
-    6. **Update issue status:** - Stage changed files to git. Print a potential commit message.
+    6. **Update issue status:** - Stage changed files to git. Run the **gcm**
+       skill (`~/.cursor/skills/gcm/SKILL.md`).
 
 ### Landing the Plane for beads enabled projects
 **MANDATORY WORKFLOW:**
@@ -153,4 +149,3 @@ and non-beads projects.
 ## Session Completion (Landing the Plane)
 
 **When ending a work session**, you MUST complete ALL steps identified for **"Land the plane"**.
-
