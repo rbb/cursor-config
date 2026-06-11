@@ -26,6 +26,28 @@ style guides live in `.cursor/rules/` and should not be pasted here.
 Symlink CLAUDE.md at the project root and this repo's contents into
 `<project>/.cursor/`.
 
+### link-project.sh
+
+From this repo, link `hooks.json` and every file under `skills/`, `rules/`, and
+`hooks/` into a destination directory, preserving the same relative paths:
+
+```bash
+mkdir -p <project dir>/.cursor
+./link-project.sh <project dir>/.cursor
+```
+
+Example mapping:
+
+```bash
+ln -s skills/gcm/SKILL.md <project dir>/.cursor/skills/gcm/SKILL.md
+```
+
+The script skips any destination path that already exists (symlink or regular
+file/directory), so it is safe to re-run after adding new skills or rules here.
+
+It does **not** link `CLAUDE.md` or `AGENTS.md` — add those at the project root
+separately (see below).
+
 **Option A — entire `.cursor` tree** (rules + hooks in one step):
 
 ```bash
