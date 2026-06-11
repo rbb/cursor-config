@@ -1,0 +1,40 @@
+---
+description: Rust formatting, naming, and error-handling conventions
+globs: **/*.rs
+alwaysApply: false
+---
+
+# Rust Style Guide
+
+- **Formatting**:
+  - When initializing a project, create rustfmt.toml with:
+      - comment_width = 80
+      - wrap_comments = true
+      - short_array_element_width_threshold = 40,
+      - unstable_features = true.
+  - Keep line comments roughly within the configured comment width.
+- **Naming**:
+  - Wire/protocol constants: SCREAMING_SNAKE_CASE
+  - Types: PascalCase.
+  - Functions and locals: snake_case.
+  - Enums tied to on-the-wire values: #[repr(...)], FromPrimitive /
+    num_enum where used, and a short comment when variant order matters
+- **Comments and section breaks**:
+  - Use /// on public items that need a stable contract (example:
+    GIT_VERSION / RELEASE_VERSION).
+  - Inside large modules, long runs of / characters separate major
+    sections
+  - Prefer comments that explain protocol, hardware, or receiver-specific
+    behavior, not a line-by-line repeat of the code.
+- **CLI Arguments**:
+  - Define commands with xflags! and document flags and subcommands with
+    /// so --help stays accurate.
+- **Clippy**:
+  - When a lint is intentionally ignored, use a narrow #[allow(...)] next
+    to the match or statement and add a short comment if the reason is not
+    obvious (handler.rs and from_str_radix).
+- **Consistency for new code**:
+  - Prefer propagating errors over bare unwrap() / expect() unless the
+    invariant is obvious or matches surrounding legacy style.
+  - Double-check spelling in public function parameters and type names so
+    APIs stay clear over time.

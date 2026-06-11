@@ -1,0 +1,28 @@
+---
+description: Python style (PEP 8, type hints, argparse conventions)
+globs: **/*.py
+alwaysApply: false
+---
+
+# Python Style Guide (PEP 8)
+
+- Indentation: Use 4 spaces per indentation level. No tabs.
+- Line Length: Maximum 79 characters. Wrap long lines.
+- Blank Lines: Two lines between top-level functions/classes; one line
+  between methods.
+- Imports: Always at the top. Group in this order: standard library,
+  third-party, local imports.
+- Naming Conventions:
+   - snake_case for variables, functions, and methods.
+   - CamelCase (PascalCase) for classes.
+   - UPPER_SNAKE_CASE for constants.
+- Whitespace:
+   - Avoid trailing whitespace.
+   - Surround operators with one space (x = 1 + 2).
+   - No spaces inside parentheses or brackets.
+- Comments: Use # (hash + space). Keep lines under 72 characters.
+- Use PEP 484 (Type Hinting).
+- All files and functions should have docstrings. Use triple double
+  quotes (""").
+- For --xxx, --no-xxxx style options use BooleanOptionalAction. Default
+  should be set to either True or False (depending on requested behavior).

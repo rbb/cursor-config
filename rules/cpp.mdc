@@ -1,0 +1,36 @@
+---
+description: C and C++ coding standards
+globs: **/*.{cpp,cc,cxx,c,h,hpp,hxx}
+alwaysApply: false
+---
+
+# C++ Style Guide
+
+- **Naming**:
+   - `snake_case` for free functions
+   - `PascalCase` for classes
+   - `m_` prefix for class members
+- **C/C++ mix**:
+   - Fixed-width integers (`uint8_t`, `int32_t`, …) where they match
+     external APIs.
+   - `memset` zero-init for large C structs before C library calls is
+     acceptable.
+   - Prefer `nullptr` over `NULL` in new code.
+- **Includes**: Prefer C++-style headers (`<cstring>`, `<cstdlib>`,
+  `<cerrno>`) in new code; legacy files may use C headers (`<string.h>`,
+  …).
+- **Unused parameters**: When signatures are fixed by an API, mark unused
+  parameters with `UNUSED(x)` (or equivalent) instead of leaving them
+  silently unused.
+- **Casts**: Prefer `static_cast` / `reinterpret_cast` over C casts when
+  touching pointers or numeric conversions in new code.
+- **Errors**: Distinguish library return codes from process exit codes.
+  Fatal setup in low-level helpers may `exit(1)` after logging;
+  higher-level code can use `try` / `catch (const std::exception &)` plus
+  a final catch-all when appropriate.
+- **Comments**:
+   - Use block comments for integration notes or non-obvious behavior.
+   - TODOs that describe temporary behavior should reference a ticket ID
+     when one exists.
+- **Formatting**: Pick one brace style (e.g. K&R vs Allman) and enforce it
+  with `clang-format`.

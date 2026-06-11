@@ -1,0 +1,11 @@
+---
+description: Markdown formatting conventions
+globs: **/*.{md,mdx,mdc}
+alwaysApply: false
+---
+
+# Markdown Style Guide
+
+- Keep lines under 79 characters.
+- Prefer '-' for bullet points.
+- Prefer ASCII only characters (character values less than 0x80).

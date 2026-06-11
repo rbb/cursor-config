@@ -1,0 +1,14 @@
+---
+description: TypeScript and JavaScript coding standards
+globs: **/*.{ts,tsx,js,jsx,mjs,cjs}
+alwaysApply: false
+---
+
+# TypeScript and JavaScript
+
+- **Style:** Clean, modular, and DRY.
+- **Naming:** Descriptive variable names > short ones. Use `camelCase`.
+- **Type Safety:** Always use TypeScript for JS projects. Avoid `any` like
+  the plague.
+- **Error Handling:** Don't just `console.error`; suggest robust recovery or
+  user-facing feedback patterns.
