@@ -1,0 +1,45 @@
+{
+  "rule_dirs": [".cursor/rules", "rules"],
+  "languages": [
+    {
+      "id": "python",
+      "mode": "hard",
+      "extensions": [".py"],
+      "rule_file": "python.mdc",
+      "format": ["ruff", "format", "{path}"],
+      "lint": ["ruff", "check", "--output-format=concise", "{path}"]
+    },
+    {
+      "id": "typescript-javascript",
+      "mode": "soft",
+      "extensions": [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"],
+      "rule_file": "typescript-javascript.mdc",
+      "format": null,
+      "lint": null
+    },
+    {
+      "id": "rust",
+      "mode": "hard",
+      "extensions": [".rs"],
+      "rule_file": "rust.mdc",
+      "format": ["rustfmt", "{path}"],
+      "lint": null
+    },
+    {
+      "id": "cpp",
+      "mode": "hard",
+      "extensions": [".cpp", ".cc", ".cxx", ".c", ".h", ".hpp", ".hxx"],
+      "rule_file": "cpp.mdc",
+      "format": ["clang-format", "-i", "{path}"],
+      "lint": null
+    },
+    {
+      "id": "markdown",
+      "mode": "soft",
+      "extensions": [".md", ".mdx", ".mdc"],
+      "rule_file": "markdown.mdc",
+      "format": null,
+      "lint": null
+    }
+  ]
+}
