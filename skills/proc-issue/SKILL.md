@@ -1,7 +1,7 @@
 ---
 name: proc-issue
 description: >-
-n  Process the next open beads issue: pick the highest-priority open issue,
+  Process the next open beads issue: pick the highest-priority open issue,
   mark it in-progress, spawn a sub-agent to implement the fix, commit with a
   Conventional Commit message, and close the issue. Use when the user says
   "proc-issue", "process next issue", "work on the next beads issue", or
