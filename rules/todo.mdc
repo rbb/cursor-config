@@ -1,0 +1,51 @@
+---
+description: Conventions for writing and updating TODO.md files
+globs: "**/TODO.md"
+alwaysApply: false
+---
+
+# TODO.md Files
+
+When writing or updating TODO.md files:
+
+- Follow the Markdown Style Guide rule (lines under 79
+  characters, ASCII only, prefer `-` for normal bullets).
+- Include this legend near the top of the file:
+
+```text
+TODO format:
+- TODO
+o in progress
+X Won't Do
+* done.
+```
+
+## Status markers
+
+Prefix each task line with one of these markers:
+
+| Marker | Meaning      |
+|--------|--------------|
+| `-`    | TODO         |
+| `o`    | in progress  |
+| `X`    | Won't Do     |
+| `*`    | done         |
+
+## Example
+
+```markdown
+# Project TODOs
+
+TODO format:
+- TODO
+o in progress
+X Won't Do
+* done.
+
+## Tasks
+
+- Add unit tests for parser
+o Wire up CLI flags
+* Fix crash on empty input
+X Support Python 2
+```
