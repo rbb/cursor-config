@@ -85,17 +85,14 @@ or switch this matching branch.
 
 `.agents/skills/update-src-rev/scripts/update_src_rev.py` (stdlib only).
 
-Helpers in the same directory (do not invoke as separate skills):
-
-- `update_src_rev_bb.py`
-- `update_src_rev_xml.py`
+Git commit/amend helpers live in `scripts/skill_git.py` (imported, not a CLI).
 
 ## CLI
 
 | Flag | Meaning |
 |------|---------|
 | `repo` | **Required.** Name or path (`mqtt-api`, `src/mqtt-api`). |
-| `--workspace` | Workspace root (passed to helpers). |
+| `--workspace` | Workspace root (default: auto-detect). |
 | `--recipe` | Recipe `.bb`/`.inc` override. |
 | `--manifest` | Manifest path override. |
 | `--srcrev` | SHA for recipe and source pin (default: source `HEAD`). |
@@ -104,7 +101,7 @@ Helpers in the same directory (do not invoke as separate skills):
 | `--base-existing` | New recipe-repo branch from current checkout, not `main`. |
 | `-n` / `--dry-run` | Dry-run only; do not write or commit. |
 
-Without `-n`, the orchestrator **always dry-runs all steps first**, then
+Without `-n`, the script **always dry-runs all steps first**, then
 applies only if every dry-run succeeds.
 
 ## Terminal
@@ -135,36 +132,47 @@ python3 ../../.agents/skills/update-src-rev/scripts/update_src_rev.py \
 
 ## Output
 
-Section headers separate each step. Final line:
+The script prints **three steps**, a **final result**, then **push hints**.
+The agent should show this output as-is (or paste it), not rewrite it
+into a different outline.
+
+**Dry run** (`-n`), already in sync:
 
 ```text
-RESULT: dry-run complete for all requested steps
-```
+Step 1 — Recipe SRCREV
 
-or
+  • Source: src/mqtt-api on feature/SUMO-588_func_test_flicker at 677be58940df4087e254c4bb4cf0a95768f6eaa2
+  • Recipe: oe/meta-judo-proprietary/recipes-python/python3-mqtt-api/python3-mqtt-api_git.bb
+  • Meta layer: oe/meta-judo-proprietary (already on matching branch)
+  • Outcome: SRCREV already matches source HEAD — no recipe commit would be made
 
-```text
-RESULT: apply complete (recipe SRCREV and manifest source project and
-manifest recipe project)
-```
+Step 2 — Manifest source project
 
-Helpers print `INFO:` and `RESULT:` lines. Read those for recipe path,
-meta-layer branch, SHAs, and per-step outcomes.
+  • Project: mqtt-api → src/mqtt-api
+  • Outcome: default.xml revision already matches source HEAD — no change
 
-After `RESULT:`, the orchestrator prints push hints (workspace-relative
-directories). Dry-run uses `PUSH (after apply):`. Example:
+Step 3 — Manifest recipe project
 
-```text
-PUSH:
-src/mqtt-api: git push origin feature/SUMO-588_func_test_flicker
-oe/meta-judo-proprietary: git push origin feature/SUMO-588_func_test_flicker
-.: git push origin feature/SUMO-588_func_test_flicker
+  • Project: meta-judo-proprietary → oe/meta-judo-proprietary at dd17e9581e34a608830123ded24e366763e724cb
+  • Outcome: default.xml revision already matches meta-layer HEAD — no change
+
+Final result
+
+  RESULT: dry-run complete for all requested steps
+
+  Everything is already in sync, so an apply run would make no commits or file changes.
+
+Push hints (informational only — not executed)
+
+  src/mqtt-api: git push origin feature/SUMO-588_func_test_flicker
+  oe/meta-judo-proprietary: git push origin feature/SUMO-588_func_test_flicker
+  .: git push origin feature/SUMO-588_func_test_flicker
 ```
 
 `.` is the manifest git repo (workspace root).
 
-**Never push.** Scripts never run `git push`. The agent never runs
-`git push`. Only list the `PUSH:` commands.
+**Never push.** The script never runs `git push`. The agent never runs
+`git push`. Only list the push hints from the script.
 
 ## Commit messages
 
@@ -212,18 +220,20 @@ When the user wants this operation:
 
 1. **Read** this skill.
 2. Confirm the **source repo** name. Ask if unclear.
-3. Run `update_src_rev.py` with `-n` first; show combined output.
+3. Run `update_src_rev.py` with `-n` first; show the script output
+   (three steps + final result + push hints) without rewriting the
+   layout.
 4. On success, run without `-n` unless the user asked for dry-run only.
-5. **Report** recipe path, meta-layer branch, both manifest pins, and
-   the `PUSH:` lines (relative directory + `git push origin <branch>`).
+5. **Report** that same three-step layout from the script. Include the
+   push hints (relative directory + `git push origin <branch>`).
 6. **Never push.** Do not run `git push` in any repo. Listing the
-   commands is the whole push-related output.
+   hints is the whole push-related output.
 
 ## Partial failure
 
 Commits land in **different** git repositories. If the recipe step
 applies but a manifest step fails, the meta-layer commit remains. The
-orchestrator prints `WARNING: partial apply` and exits non-zero. Do not
+script prints `WARNING: partial apply` and exits non-zero. Do not
 retry blindly; inspect git state in both repos before re-running.
 
 ## Errors to expect

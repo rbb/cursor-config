@@ -18,184 +18,955 @@ import argparse
 import re
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from skill_git import (
+    ISSUE_RE,
     commit_or_amend,
+    eprint,
+    extract_issue,
     find_workspace_root,
+    git_ref_exists,
+    git_try,
+    is_git_repo,
     is_revision_only_diff,
+    is_srcrev_only_diff,
     path_is_dirty,
     run_git,
+    workspace_rel,
 )
 
-SCRIPTS = Path(__file__).resolve().parent
-BB_SCRIPT = SCRIPTS / "update_src_rev_bb.py"
-XML_SCRIPT = SCRIPTS / "update_src_rev_xml.py"
-
-META_LAYER_RE = re.compile(r"^INFO: meta layer (\S+)\s*$", re.MULTILINE)
-META_HEAD_RE = re.compile(
-    r"^INFO: meta-layer HEAD ([0-9a-fA-F]{7,40})\s*$",
+SRC_PATH_RE = re.compile(r"src/([A-Za-z0-9_.-]+)")
+SRCREV_LINE_RE = re.compile(
+    r'^(SRCREV(?:_[\w-]+)?)(\s*(?:\?=|=)\s*)"([0-9a-fA-F]{7,40})"',
     re.MULTILINE,
 )
-ISSUE_RE = re.compile(r"[A-Z][A-Z0-9]*-\d+")
-SOURCE_BRANCH_RE = re.compile(r"^INFO: source branch (.+)$", re.MULTILINE)
-PROJECT_LINE_RE = re.compile(
-    r"^INFO: project name=(\S+) path=(\S+)\s*$",
-    re.MULTILINE,
-)
-REVISION_LINE_RE = re.compile(
-    r"^INFO: revision: (\S+) -> (\S+)\s*$",
-    re.MULTILINE,
-)
-RECIPE_LINE_RE = re.compile(r"^INFO: recipe (\S+)\s*$", re.MULTILINE)
-SRCREV_CHANGE_RE = re.compile(
-    r"^INFO: (SRCREV(?:_[\w-]+)?): (\S+) -> (\S+)\s*$",
-    re.MULTILINE,
-)
-XML_CHANGED_RE = re.compile(
-    r"^RESULT: (?:updated|would update) manifest ",
-    re.MULTILINE,
-)
-PUSH_RE = re.compile(r"^INFO: push (.+)$", re.MULTILINE)
+NAME_PARAM_RE = re.compile(r"(?:^|;)\s*name=([A-Za-z0-9_.-]+)")
+ATTR_NAME = re.compile(r'\bname="([^"]*)"')
+ATTR_PATH = re.compile(r'\bpath="([^"]*)"')
+REVISION_ATTR_START = re.compile(r'\brevision="')
 
 
-def eprint(msg: str) -> None:
-    print(msg, file=sys.stderr)
+@dataclass
+class RecipeResult:
+    src_rel: str
+    src_branch: str
+    srcrev: str
+    recipe_path: str
+    meta_rel: str
+    meta_head: str
+    meta_note: str
+    var_name: str
+    old_rev: str
+    changed: bool
+    outcome: str
+    push_hints: list[str] = field(default_factory=list)
+    issue: str | None = None
 
 
-def run_step(label: str, cmd: list[str], dry_run: bool) -> tuple[int, str]:
-    mode = "dry-run" if dry_run else "apply"
-    print(f"=== {label} ({mode}) ===", flush=True)
-    result = subprocess.run(
-        cmd,
-        check=False,
-        capture_output=True,
-        text=True,
+@dataclass
+class ManifestPinResult:
+    project_name: str
+    project_path: str
+    old_revision: str
+    new_revision: str
+    changed: bool
+    outcome: str
+    push_hints: list[str] = field(default_factory=list)
+    manifest_rel: str = "default.xml"
+
+
+# --- recipe ---
+
+
+def parse_repo_arg(
+    repo_arg: str, workspace: Path
+) -> tuple[Path | None, Path | None]:
+    """Return (src_repo, meta_layer) paths implied by repo_arg."""
+    raw = repo_arg.strip().strip("/")
+    if not raw:
+        raise SystemExit("ERROR: repo name is required")
+
+    if raw.startswith("src/"):
+        name = raw[len("src/") :]
+        return workspace / "src" / name, None
+
+    if raw.startswith("oe/"):
+        name = raw[len("oe/") :]
+        return None, workspace / "oe" / name
+
+    src_candidate = workspace / "src" / raw
+    oe_candidate = workspace / "oe" / raw
+
+    src_exists = src_candidate.is_dir() and is_git_repo(src_candidate)
+    oe_exists = oe_candidate.is_dir() and is_git_repo(oe_candidate)
+
+    if src_exists and oe_exists:
+        raise SystemExit(
+            f"ERROR: ambiguous repo name {raw!r}; use src/{raw} or oe/{raw}"
+        )
+    if src_exists:
+        return src_candidate, None
+    if oe_exists:
+        if not raw.startswith("meta-judo"):
+            raise SystemExit(
+                f"ERROR: oe repo {raw!r} is not a meta-judo* layer"
+            )
+        return None, oe_candidate
+
+    raise SystemExit(
+        f"ERROR: repo not found under src/ or oe/: {raw!r} "
+        "(examples: mqtt-api, src/mqtt-api, meta-judo-proprietary, "
+        "oe/meta-judo-proprietary)"
     )
-    if result.stdout:
-        print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
-    if result.stderr:
-        print(
-            result.stderr,
-            end="" if result.stderr.endswith("\n") else "\n",
-            file=sys.stderr,
-        )
-    print(flush=True)
-    return result.returncode, result.stdout
 
 
-def parse_bb_meta(stdout: str) -> tuple[str, str]:
-    layer_match = META_LAYER_RE.search(stdout)
-    head_match = META_HEAD_RE.search(stdout)
-    if not layer_match:
+def infer_from_cwd(cwd: Path, workspace: Path) -> tuple[Path | None, Path | None]:
+    resolved = cwd.resolve()
+    try:
+        rel = resolved.relative_to(workspace)
+    except ValueError:
+        return None, None
+
+    parts = rel.parts
+    if len(parts) >= 2 and parts[0] == "src":
+        src_repo = workspace / "src" / parts[1]
+        if is_git_repo(src_repo):
+            return src_repo, None
+
+    if len(parts) >= 2 and parts[0] == "oe" and parts[1].startswith("meta-judo"):
+        meta_layer = workspace / "oe" / parts[1]
+        if is_git_repo(meta_layer):
+            return None, meta_layer
+
+    return None, None
+
+
+def meta_layer_roots(workspace: Path) -> list[Path]:
+    oe_dir = workspace / "oe"
+    if not oe_dir.is_dir():
+        raise SystemExit(f"ERROR: missing oe/ under workspace {workspace}")
+    roots = sorted(oe_dir.glob("meta-judo*"))
+    if not roots:
+        raise SystemExit("ERROR: no oe/meta-judo* layers found")
+    return roots
+
+
+def resolve_repos(
+    repo_arg: str, cwd: Path, workspace: Path
+) -> tuple[Path, list[Path]]:
+    src_from_arg, meta_from_arg = parse_repo_arg(repo_arg, workspace)
+    src_from_cwd, meta_from_cwd = infer_from_cwd(cwd, workspace)
+
+    src_repo = src_from_arg or src_from_cwd
+    meta_layer = meta_from_arg or meta_from_cwd
+
+    if not src_repo:
         raise SystemExit(
-            "ERROR: could not parse INFO: meta layer from BB output"
+            "ERROR: source repo not resolved; pass a source repo name "
+            "(e.g. mqtt-api, src/mqtt-api) or cd to src/<repo>"
         )
-    if not head_match:
+    if not is_git_repo(src_repo):
+        raise SystemExit(f"ERROR: not a git repo: {src_repo}")
+
+    if meta_layer:
+        if not is_git_repo(meta_layer):
+            raise SystemExit(f"ERROR: not a git repo: {meta_layer}")
+        if not meta_layer.name.startswith("meta-judo"):
+            raise SystemExit(
+                f"ERROR: oe repo must be a meta-judo* layer: {meta_layer}"
+            )
+        layers = [meta_layer]
+    else:
+        layers = meta_layer_roots(workspace)
+
+    return src_repo, layers
+
+
+def recipe_references_repo(content: str, repo_name: str) -> bool:
+    needle = f"src/{repo_name}"
+    for match in SRC_PATH_RE.finditer(content):
+        if match.group(1) == repo_name:
+            return True
+    return needle in content
+
+
+def git_entries_for_repo(content: str, repo_name: str) -> list[str]:
+    entries: list[str] = []
+    for line in content.splitlines():
+        if f"src/{repo_name}" not in line:
+            continue
+        if "git://" in line or "GIT_URI" in line or "EXTERNALSRC" in line:
+            entries.append(line)
+    return entries
+
+
+def srcrev_var_names(content: str, repo_name: str) -> list[str]:
+    entries = git_entries_for_repo(content, repo_name)
+    if not entries:
+        return []
+
+    names: list[str] = []
+    for entry in entries:
+        name_match = NAME_PARAM_RE.search(entry)
+        if name_match:
+            names.append(f"SRCREV_{name_match.group(1)}")
+        elif "EXTERNALSRC" in entry or "GIT_URI" in entry:
+            names.append("SRCREV")
+        elif "git://" in entry:
+            names.append("SRCREV")
+
+    deduped: list[str] = []
+    for name in names:
+        if name not in deduped:
+            deduped.append(name)
+    return deduped
+
+
+def srcrev_vars_in_file(content: str) -> set[str]:
+    return {match.group(1) for match in SRCREV_LINE_RE.finditer(content)}
+
+
+def find_srcrev_targets(content: str, repo_name: str) -> list[str]:
+    candidates = srcrev_var_names(content, repo_name)
+    if not candidates:
+        return []
+
+    present = srcrev_vars_in_file(content)
+    resolved = [name for name in candidates if name in present]
+    if not resolved:
+        return []
+    if len(resolved) > 1:
         raise SystemExit(
-            "ERROR: could not parse INFO: meta-layer HEAD from BB output"
+            "ERROR: ambiguous SRCREV targets for "
+            f"src/{repo_name}: {', '.join(resolved)}"
         )
-    return layer_match.group(1), head_match.group(1)
+    return resolved
 
 
-def collect_pushes(*stdouts: str) -> list[str]:
+def discover_recipes(layers: list[Path], repo_name: str) -> list[Path]:
+    matches: list[Path] = []
+    for layer in layers:
+        for path in layer.rglob("*"):
+            if path.suffix not in {".bb", ".inc"}:
+                continue
+            try:
+                content = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            if recipe_references_repo(content, repo_name):
+                if find_srcrev_targets(content, repo_name):
+                    matches.append(path)
+    return sorted(matches)
+
+
+def choose_srcrev_vars(content: str, repo_name: str) -> list[str]:
+    targets = find_srcrev_targets(content, repo_name)
+    if targets:
+        return targets
+
+    candidates = srcrev_var_names(content, repo_name)
+    if candidates:
+        raise SystemExit(
+            f"ERROR: recipe references src/{repo_name} but no matching "
+            f"SRCREV vars found ({', '.join(candidates)})"
+        )
+    return []
+
+
+def replace_srcrev(content: str, var_name: str, new_rev: str) -> tuple[str, bool]:
+    pattern = re.compile(
+        rf'^({re.escape(var_name)})(\s*(?:\?=|=)\s*)"([0-9a-fA-F]{{7,40}})"',
+        re.MULTILINE,
+    )
+
+    def repl(match: re.Match[str]) -> str:
+        return f'{match.group(1)}{match.group(2)}"{new_rev}"'
+
+    updated, count = pattern.subn(repl, content, count=1)
+    return updated, count == 1
+
+
+def recipe_display_name(path: Path) -> str:
+    stem = path.stem
+    if stem.endswith("_git"):
+        return stem[: -len("_git")]
+    return stem
+
+
+def recipe_display_path(recipe: Path, workspace: Path) -> str:
+    return workspace_rel(recipe, workspace)
+
+
+def resolve_recipe(
+    layers: list[Path],
+    repo_name: str,
+    recipe_arg: str | None,
+    workspace: Path,
+) -> Path:
+    if recipe_arg:
+        recipe = Path(recipe_arg)
+        if not recipe.is_absolute():
+            recipe = (workspace / recipe).resolve()
+        else:
+            recipe = recipe.resolve()
+        if not recipe.is_file():
+            raise SystemExit(f"ERROR: recipe not found: {recipe}")
+        content = recipe.read_text(encoding="utf-8")
+        if not recipe_references_repo(content, repo_name):
+            eprint(
+                f"WARNING: {recipe} does not reference src/{repo_name}; "
+                "continuing because --recipe was provided"
+            )
+        return recipe
+
+    matches = discover_recipes(layers, repo_name)
+    layer_hint = layers[0] if len(layers) == 1 else None
+    scope = f" under {layer_hint}" if layer_hint else " under oe/meta-judo*"
+    if not matches:
+        raise SystemExit(
+            f"ERROR: no .bb/.inc recipe found for src/{repo_name}{scope}"
+        )
+    if len(matches) > 1:
+        listing = "\n".join(f"  - {path}" for path in matches)
+        raise SystemExit(
+            "ERROR: multiple recipes reference "
+            f"src/{repo_name}; pass --recipe:\n{listing}"
+        )
+    return matches[0]
+
+
+def source_branch_name(src_repo: Path) -> str:
+    branch = run_git(["branch", "--show-current"], src_repo)
+    if not branch:
+        raise SystemExit(
+            "ERROR: source repo is not on a named branch "
+            "(detached HEAD); cannot match meta-layer branch"
+        )
+    return branch
+
+
+def meta_repo_for_recipe(recipe: Path) -> Path:
+    return Path(run_git(["rev-parse", "--show-toplevel"], recipe.parent))
+
+
+def recipe_branch_start_point(
+    meta_repo: Path, base_existing: bool
+) -> tuple[str, str]:
+    """Return (start_ref, sha) for a new recipe-repo branch."""
+    if base_existing:
+        current = run_git(["branch", "--show-current"], meta_repo)
+        start_ref = current if current else "HEAD"
+        sha = run_git(["rev-parse", "HEAD"], meta_repo)
+        return start_ref, sha
+    if git_ref_exists(meta_repo, "refs/remotes/origin/main"):
+        sha = run_git(["rev-parse", "refs/remotes/origin/main"], meta_repo)
+        return "origin/main", sha
+    if git_ref_exists(meta_repo, "refs/heads/main"):
+        sha = run_git(["rev-parse", "refs/heads/main"], meta_repo)
+        return "main", sha
+    raise SystemExit(
+        "ERROR: no main or origin/main in recipe repo; "
+        "pass --base-existing or fetch main"
+    )
+
+
+def ensure_matching_branch(
+    meta_repo: Path,
+    branch: str,
+    dry_run: bool,
+    base_existing: bool,
+) -> tuple[str, str]:
+    """Checkout or create branch. Return (HEAD SHA, human note).
+
+    New branches start from origin/main (or main) unless base_existing.
+    """
+    local_ref = f"refs/heads/{branch}"
+    remote_ref = f"refs/remotes/origin/{branch}"
+    current = run_git(["branch", "--show-current"], meta_repo)
+
+    if current == branch:
+        sha = run_git(["rev-parse", "HEAD"], meta_repo)
+        return sha, "already on matching branch"
+
+    if git_ref_exists(meta_repo, local_ref):
+        sha = run_git(["rev-parse", local_ref], meta_repo)
+        if dry_run:
+            return sha, f"would checkout existing branch {branch}"
+        run_git(["checkout", branch], meta_repo)
+        return run_git(["rev-parse", "HEAD"], meta_repo), (
+            f"checked out existing branch {branch}"
+        )
+
+    if git_ref_exists(meta_repo, remote_ref):
+        sha = run_git(["rev-parse", remote_ref], meta_repo)
+        if dry_run:
+            return sha, f"would checkout existing origin/{branch}"
+        run_git(
+            ["checkout", "-B", branch, f"origin/{branch}"],
+            meta_repo,
+        )
+        return run_git(["rev-parse", "HEAD"], meta_repo), (
+            f"checked out existing origin/{branch}"
+        )
+
+    start_ref, sha = recipe_branch_start_point(
+        meta_repo, base_existing
+    )
+    if dry_run:
+        return sha, f"would create branch {branch} from {start_ref}"
+    run_git(["checkout", "-b", branch, start_ref], meta_repo)
+    return run_git(["rev-parse", "HEAD"], meta_repo), (
+        f"created branch {branch} from {start_ref}"
+    )
+
+
+def require_commit_in_source(src_repo: Path, sha: str) -> None:
+    """Fail if sha is not a commit in the source repo history."""
+    if not sha or sha == "?":
+        raise SystemExit(
+            "ERROR: existing SRCREV is missing or unreadable; "
+            "cannot verify it in source history"
+        )
+    result = git_try(
+        ["rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}"],
+        src_repo,
+    )
+    if result.returncode != 0:
+        raise SystemExit(
+            f"ERROR: existing SRCREV {sha} is not a commit in "
+            f"{src_repo} history; fetch or check the recipe pin"
+        )
+    _ = result.stdout.strip() or sha
+
+
+def commit_recipe(recipe: Path, issue: str, recipe_name: str) -> str:
+    meta_repo = Path(run_git(["rev-parse", "--show-toplevel"], recipe.parent))
+    rel = str(recipe.relative_to(meta_repo))
+    message = f"{issue}:{recipe_name} Update SRCREV"
+    return commit_or_amend(
+        meta_repo, rel, message, is_srcrev_only_diff, quiet=True
+    )
+
+
+def update_recipe(
+    args: argparse.Namespace,
+    workspace: Path,
+    dry_run: bool,
+) -> RecipeResult:
+    cwd = Path.cwd()
+    src_repo, layers = resolve_repos(args.repo, cwd, workspace)
+    repo_name = src_repo.name
+    srcrev = args.srcrev or run_git(["rev-parse", "HEAD"], src_repo)
+    src_branch = source_branch_name(src_repo)
+
+    recipe = resolve_recipe(layers, repo_name, args.recipe, workspace)
+    recipe_path = recipe_display_path(recipe, workspace)
+    meta_repo = meta_repo_for_recipe(recipe)
+    meta_rel = recipe_display_path(meta_repo, workspace)
+    src_rel = recipe_display_path(src_repo, workspace)
+    pushes = [
+        f"{src_rel}: git push origin {src_branch}",
+        f"{meta_rel}: git push origin {src_branch}",
+    ]
+
+    meta_head, meta_note = ensure_matching_branch(
+        meta_repo,
+        src_branch,
+        dry_run,
+        args.base_existing,
+    )
+    if not dry_run and not recipe.is_file():
+        raise SystemExit(
+            f"ERROR: recipe missing after checkout {src_branch}: "
+            f"{recipe_path}"
+        )
+    content = recipe.read_text(encoding="utf-8")
+
+    targets = choose_srcrev_vars(content, repo_name)
+    if not targets:
+        raise SystemExit(
+            f"ERROR: could not determine SRCREV variable for src/{repo_name} "
+            f"in {recipe}"
+        )
+
+    var_name = targets[0]
+    old_rev = "?"
+    for match in SRCREV_LINE_RE.finditer(content):
+        if match.group(1) == var_name:
+            old_rev = match.group(3)
+            break
+
+    require_commit_in_source(src_repo, old_rev)
+
+    result = RecipeResult(
+        src_rel=src_rel,
+        src_branch=src_branch,
+        srcrev=srcrev,
+        recipe_path=recipe_path,
+        meta_rel=meta_rel,
+        meta_head=meta_head,
+        meta_note=meta_note,
+        var_name=var_name,
+        old_rev=old_rev,
+        changed=old_rev != srcrev,
+        outcome="",
+        push_hints=pushes,
+        issue=args.issue or extract_issue(recipe.parent, src_repo),
+    )
+
+    if old_rev == srcrev:
+        result.outcome = (
+            "SRCREV already matches source HEAD — no recipe commit "
+            + ("would be made" if dry_run else "made")
+        )
+        return result
+
+    updated, changed = replace_srcrev(content, var_name, srcrev)
+    if not changed:
+        raise SystemExit(
+            f"ERROR: failed to update {var_name} in {recipe_path}"
+        )
+
+    if dry_run:
+        result.outcome = (
+            f"would update {var_name} {old_rev} -> {srcrev} and commit"
+        )
+        return result
+
+    recipe.write_text(updated, encoding="utf-8")
+
+    if args.no_commit:
+        meta_head = run_git(["rev-parse", "HEAD"], meta_repo)
+        result.meta_head = meta_head
+        result.outcome = f"updated {var_name}; did not commit"
+        return result
+
+    if not result.issue:
+        raise SystemExit(
+            "ERROR: could not parse issue id from branch name; pass --issue"
+        )
+
+    kind = commit_recipe(recipe, result.issue, recipe_display_name(recipe))
+    meta_head = run_git(["rev-parse", "HEAD"], meta_repo)
+    result.meta_head = meta_head
+    result.outcome = f"{kind} {var_name} {old_rev} -> {srcrev}"
+    return result
+
+
+# --- manifest ---
+
+
+def normalize_project_arg(project_arg: str) -> tuple[str | None, str | None]:
+    """Return (name, path) hints from the project argument."""
+    raw = project_arg.strip().strip("/")
+    if not raw:
+        raise SystemExit("ERROR: project name is required")
+
+    if raw.startswith("src/") or raw.startswith("oe/") or raw.startswith(
+        "test/"
+    ) or raw.startswith("devops/") or raw.startswith("extras/"):
+        return None, raw
+
+    return raw, f"src/{raw}"
+
+
+def infer_project_from_cwd(
+    cwd: Path, workspace: Path
+) -> tuple[str | None, str | None]:
+    resolved = cwd.resolve()
+    try:
+        rel = resolved.relative_to(workspace)
+    except ValueError:
+        return None, None
+
+    parts = rel.parts
+    if len(parts) >= 2:
+        return None, "/".join(parts[:2])
+    if len(parts) == 1 and parts[0] != ".":
+        return parts[0], None
+    return None, None
+
+
+def is_project_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped.startswith("<project"):
+        return False
+    return "/>" in stripped
+
+
+def parse_project_attrs(line: str) -> tuple[str, str] | None:
+    nm = ATTR_NAME.search(line)
+    pm = ATTR_PATH.search(line)
+    if not nm or not pm:
+        return None
+    return (nm.group(1), pm.group(1))
+
+
+def revision_value_span(line: str) -> tuple[int, int] | None:
+    match = REVISION_ATTR_START.search(line)
+    if not match:
+        return None
+    value_start = match.end()
+    value_end = line.find('"', value_start)
+    if value_end < 0:
+        return None
+    return (value_start, value_end)
+
+
+def parse_revision(line: str) -> str | None:
+    span = revision_value_span(line)
+    if not span:
+        return None
+    return line[span[0] : span[1]]
+
+
+def escape_attr_value(value: str) -> str:
+    return (
+        value.replace("&", "&amp;")
+        .replace('"', "&quot;")
+        .replace("<", "&lt;")
+    )
+
+
+def merge_revision_into_line(line: str, new_revision: str) -> str:
+    esc = escape_attr_value(new_revision)
+    span = revision_value_span(line)
+    if span:
+        value_start, value_end = span
+        return line[:value_start] + esc + line[value_end:]
+
+    closing = line.rfind("/>")
+    if closing < 0:
+        return line
+    before = line[:closing]
+    after = line[closing:]
+    sep = "" if before.endswith((" ", "\t")) else " "
+    return f'{before}{sep}revision="{esc}" {after}'
+
+
+def project_matches(
+    name: str,
+    path: str,
+    name_hint: str | None,
+    path_hint: str | None,
+) -> bool:
+    if name_hint and name == name_hint:
+        return True
+    if path_hint and path == path_hint:
+        return True
+    return False
+
+
+def find_project_matches(
+    manifest_text: str,
+    name_hint: str | None,
+    path_hint: str | None,
+) -> list[tuple[int, str, str, str]]:
+    matches: list[tuple[int, str, str, str]] = []
+    for index, line in enumerate(manifest_text.splitlines(keepends=True)):
+        raw = line.rstrip("\r\n")
+        if not is_project_line(raw):
+            continue
+        attrs = parse_project_attrs(raw)
+        if not attrs:
+            continue
+        name, path = attrs
+        if project_matches(name, path, name_hint, path_hint):
+            revision = parse_revision(raw) or ""
+            matches.append((index, name, path, revision))
+    return matches
+
+
+def validate_manifest(path: Path) -> None:
+    try:
+        ET.parse(path)
+    except ET.ParseError as exc:
+        raise SystemExit(f"ERROR: invalid XML after write: {exc}") from exc
+
+
+def resolve_source_repo(
+    workspace: Path, project_path: str, cwd: Path
+) -> Path:
+    candidate = workspace / project_path
+    if candidate.is_dir() and is_git_repo(candidate):
+        return candidate
+
+    inferred_name, inferred_path = infer_project_from_cwd(cwd, workspace)
+    if inferred_path and inferred_path == project_path:
+        if candidate.is_dir() and is_git_repo(candidate):
+            return candidate
+
+    raise SystemExit(
+        f"ERROR: source repo not found or not a git repo: {candidate}"
+    )
+
+
+def update_manifest_pin(
+    workspace: Path,
+    manifest: Path,
+    project: str,
+    revision: str | None,
+    dry_run: bool,
+) -> ManifestPinResult:
+    cwd = Path.cwd()
+    if not manifest.is_file():
+        raise SystemExit(f"ERROR: manifest not found: {manifest}")
+
+    name_hint, path_hint = normalize_project_arg(project)
+    cwd_name, cwd_path = infer_project_from_cwd(cwd, workspace)
+    name_hint = name_hint or cwd_name
+    path_hint = path_hint or cwd_path
+
+    if not name_hint and not path_hint:
+        raise SystemExit(
+            "ERROR: project not resolved; pass a project name "
+            "(e.g. mqtt-api, src/mqtt-api) or cd to the source repo"
+        )
+
+    manifest_text = manifest.read_text(encoding="utf-8")
+    matches = find_project_matches(manifest_text, name_hint, path_hint)
+    if not matches:
+        raise SystemExit(
+            f"ERROR: no <project> found in {manifest} for "
+            f"name={name_hint!r} path={path_hint!r}"
+        )
+    if len(matches) > 1:
+        listing = "\n".join(
+            f"  - name={name} path={path}" for _, name, path, _ in matches
+        )
+        raise SystemExit(
+            "ERROR: multiple manifest projects match; be more specific:\n"
+            f"{listing}"
+        )
+
+    line_index, project_name, project_path, old_revision = matches[0]
+    src_repo = resolve_source_repo(workspace, project_path, cwd)
+    new_revision = revision or run_git(["rev-parse", "HEAD"], src_repo)
+    manifest_rel = workspace_rel(manifest, workspace)
+
+    manifest_repo = Path(
+        run_git(["rev-parse", "--show-toplevel"], manifest.parent)
+    )
+    manifest_repo_rel = workspace_rel(manifest_repo, workspace)
+    manifest_branch = run_git(["branch", "--show-current"], manifest_repo)
+    pushes: list[str] = []
+    if manifest_branch:
+        pushes.append(
+            f"{manifest_repo_rel}: git push origin {manifest_branch}"
+        )
+
+    already = old_revision == new_revision
+    if already:
+        outcome = (
+            f"{manifest_rel} revision already matches "
+            f"{project_path} HEAD — no change"
+        )
+    elif dry_run:
+        outcome = (
+            f"would update {manifest_rel} revision "
+            f"{old_revision} -> {new_revision}"
+        )
+    else:
+        outcome = (
+            f"updated {manifest_rel} revision "
+            f"{old_revision} -> {new_revision}"
+        )
+
+    result = ManifestPinResult(
+        project_name=project_name,
+        project_path=project_path,
+        old_revision=old_revision,
+        new_revision=new_revision,
+        changed=not already,
+        outcome=outcome,
+        push_hints=pushes,
+        manifest_rel=str(manifest_rel),
+    )
+
+    if already:
+        return result
+
+    lines = manifest_text.splitlines(keepends=True)
+    updated_line = merge_revision_into_line(
+        lines[line_index].rstrip("\r\n"),
+        new_revision,
+    )
+    if not updated_line.endswith("\n"):
+        updated_line += "\n"
+    lines[line_index] = updated_line
+    updated_text = "".join(lines)
+
+    if dry_run:
+        return result
+
+    manifest.write_text(updated_text, encoding="utf-8")
+    validate_manifest(manifest)
+    return result
+
+
+# --- orchestrator ---
+
+
+def print_pushes(lines: list[str]) -> None:
+    """Print suggested push commands. Never run git push."""
+    if not lines:
+        return
+    print("Push hints (informational only — not executed)")
+    print()
+    for line in lines:
+        print(f"  {line}")
+    print()
+
+
+def print_step(title: str, bullets: list[str]) -> None:
+    print(title)
+    print()
+    for item in bullets:
+        print(f"  • {item}")
+    print()
+
+
+def print_report(
+    recipe: RecipeResult,
+    source_pin: ManifestPinResult,
+    recipe_pin: ManifestPinResult,
+    dry_run: bool,
+    applied: list[str] | None = None,
+    incomplete: bool = False,
+) -> None:
+    print_step(
+        "Step 1 — Recipe SRCREV",
+        [
+            (
+                f"Source: {recipe.src_rel} on {recipe.src_branch} "
+                f"at {recipe.srcrev}"
+            ),
+            f"Recipe: {recipe.recipe_path}",
+            f"Meta layer: {recipe.meta_rel} ({recipe.meta_note})",
+            f"Outcome: {recipe.outcome}",
+        ],
+    )
+    source_outcome = source_pin.outcome
+    if not source_pin.changed:
+        source_outcome = (
+            "default.xml revision already matches source HEAD — no change"
+        )
+    print_step(
+        "Step 2 — Manifest source project",
+        [
+            f"Project: {source_pin.project_name} → {source_pin.project_path}",
+            f"Outcome: {source_outcome}",
+        ],
+    )
+    recipe_outcome = recipe_pin.outcome
+    if not recipe_pin.changed:
+        recipe_outcome = (
+            "default.xml revision already matches meta-layer HEAD — no change"
+        )
+    print_step(
+        "Step 3 — Manifest recipe project",
+        [
+            (
+                f"Project: {recipe_pin.project_name} → "
+                f"{recipe_pin.project_path} at {recipe_pin.new_revision}"
+            ),
+            f"Outcome: {recipe_outcome}",
+        ],
+    )
+    print("Final result")
+    print()
+    if incomplete:
+        print("  RESULT: apply incomplete")
+        print()
+        return
+    if dry_run:
+        print("  RESULT: dry-run complete for all requested steps")
+        print()
+        if not recipe.changed and not source_pin.changed and not recipe_pin.changed:
+            print(
+                "  Everything is already in sync, so an apply run would "
+                "make no commits or file changes."
+            )
+            print()
+        elif source_pin.changed or recipe_pin.changed:
+            print(
+                "  An apply run would use one default.xml commit "
+                "(amend if HEAD only changed revision attrs)."
+            )
+            print()
+        return
+    targets = " and ".join(applied or [])
+    print(f"  RESULT: apply complete ({targets})")
+    print()
+
+
+def collect_pushes(*groups: list[str]) -> list[str]:
     seen: set[str] = set()
     lines: list[str] = []
-    for text in stdouts:
-        for match in PUSH_RE.finditer(text):
-            hint = match.group(1)
+    for group in groups:
+        for hint in group:
             if hint not in seen:
                 seen.add(hint)
                 lines.append(hint)
     return lines
 
 
-def print_pushes(lines: list[str], dry_run: bool) -> None:
-    """Print suggested push commands. Never run git push."""
-    if not lines:
-        return
-    header = "PUSH (after apply):" if dry_run else "PUSH:"
-    print(header, flush=True)
-    for line in lines:
-        print(line, flush=True)
-    print("INFO: listed push commands only; did not push", flush=True)
-
-
-def issue_from_bb(stdout: str, args: argparse.Namespace) -> str | None:
+def issue_for_manifest(
+    args: argparse.Namespace, recipe: RecipeResult
+) -> str:
     if args.issue:
         return args.issue
-    match = SOURCE_BRANCH_RE.search(stdout)
-    if not match:
-        return None
-    found = ISSUE_RE.search(match.group(1))
-    return found.group(0) if found else None
-
-
-def branch_from_bb(stdout: str) -> str | None:
-    match = SOURCE_BRANCH_RE.search(stdout)
-    if not match:
-        return None
-    branch = match.group(1).strip()
-    return branch or None
-
-
-def parse_xml_project(stdout: str) -> dict[str, str] | None:
-    project = PROJECT_LINE_RE.search(stdout)
-    if not project:
-        return None
-    revision = REVISION_LINE_RE.search(stdout)
-    return {
-        "name": project.group(1),
-        "path": project.group(2),
-        "old": revision.group(1) if revision else "?",
-        "new": revision.group(2) if revision else "?",
-    }
+    found = ISSUE_RE.search(recipe.src_branch)
+    if found:
+        return found.group(0)
+    if recipe.issue:
+        return recipe.issue
+    raise SystemExit(
+        "ERROR: could not parse issue id from branch name; pass --issue"
+    )
 
 
 def manifest_commit_message(
     issue: str,
     branch: str,
-    bb_out: str,
-    xml_outs: list[str],
+    recipe: RecipeResult,
+    pins: list[ManifestPinResult],
 ) -> str:
     """Workspace commit: subject uses branch; body lists both projects."""
     subject = f"{issue}:{branch} Update SRCREV"
     lines: list[str] = []
-    if xml_outs:
-        source = parse_xml_project(xml_outs[0])
-        if source:
-            lines.extend(
-                [
-                    "Source project:",
-                    f"  name: {source['name']}",
-                    f"  path: {source['path']}",
-                    f"  revision: {source['old']} -> {source['new']}",
-                ]
-            )
-    recipe_proj = (
-        parse_xml_project(xml_outs[1]) if len(xml_outs) > 1 else None
-    )
-    recipe_path = RECIPE_LINE_RE.search(bb_out)
-    srcrev = SRCREV_CHANGE_RE.search(bb_out)
-    if recipe_proj or recipe_path or srcrev:
+    if pins:
+        source = pins[0]
+        lines.extend(
+            [
+                "Source project:",
+                f"  name: {source.project_name}",
+                f"  path: {source.project_path}",
+                f"  revision: {source.old_revision} -> {source.new_revision}",
+            ]
+        )
+    recipe_pin = pins[1] if len(pins) > 1 else None
+    if recipe_pin or recipe.recipe_path or recipe.var_name:
         if lines:
             lines.append("")
         lines.append("Recipe project:")
-        if recipe_proj:
+        if recipe_pin:
             lines.extend(
                 [
-                    f"  name: {recipe_proj['name']}",
-                    f"  path: {recipe_proj['path']}",
-                    f"  revision: {recipe_proj['old']} -> "
-                    f"{recipe_proj['new']}",
+                    f"  name: {recipe_pin.project_name}",
+                    f"  path: {recipe_pin.project_path}",
+                    f"  revision: {recipe_pin.old_revision} -> "
+                    f"{recipe_pin.new_revision}",
                 ]
             )
-        if recipe_path:
-            lines.append(f"  recipe: {recipe_path.group(1)}")
-        if srcrev:
+        if recipe.recipe_path:
+            lines.append(f"  recipe: {recipe.recipe_path}")
+        if recipe.var_name:
             lines.append(
-                f"  {srcrev.group(1)}: {srcrev.group(2)} -> "
-                f"{srcrev.group(3)}"
+                f"  {recipe.var_name}: {recipe.old_rev} -> {recipe.srcrev}"
             )
     body = "\n".join(lines).rstrip()
     if body:
@@ -203,20 +974,12 @@ def manifest_commit_message(
     return subject
 
 
-def xml_changed(*stdouts: str) -> bool:
-    return any(XML_CHANGED_RE.search(text) for text in stdouts)
-
-
 def commit_manifest_bundle(
     args: argparse.Namespace,
-    bb_out: str,
-    xml_outs: list[str],
+    workspace: Path,
+    recipe: RecipeResult,
+    pins: list[ManifestPinResult],
 ) -> None:
-    workspace = (
-        Path(args.workspace).resolve()
-        if args.workspace
-        else find_workspace_root(Path.cwd())
-    )
     manifest = (
         Path(args.manifest).resolve()
         if args.manifest
@@ -228,75 +991,14 @@ def commit_manifest_bundle(
     except ValueError:
         rel = str(manifest)
     if not path_is_dirty(repo, rel):
-        print("INFO: no manifest changes to commit", flush=True)
         return
-    issue = issue_from_bb(bb_out, args)
-    if not issue:
-        raise SystemExit(
-            "ERROR: could not parse issue id from branch name; pass --issue"
-        )
-    branch = branch_from_bb(bb_out)
-    if not branch:
-        raise SystemExit(
-            "ERROR: could not parse source branch name from recipe step"
-        )
-    message = manifest_commit_message(issue, branch, bb_out, xml_outs)
-    kind = commit_or_amend(
-        repo, rel, message, is_revision_only_diff
+    issue = issue_for_manifest(args, recipe)
+    message = manifest_commit_message(
+        issue, recipe.src_branch, recipe, pins
     )
-    if kind == "amended":
-        print("INFO: reused revision commit for default.xml", flush=True)
-    print("RESULT: manifest commit complete", flush=True)
-
-
-def build_common_args(args: argparse.Namespace) -> list[str]:
-    common: list[str] = []
-    if args.workspace:
-        common.extend(["--workspace", args.workspace])
-    if args.issue:
-        common.extend(["--issue", args.issue])
-    return common
-
-
-def build_bb_cmd(
-    args: argparse.Namespace, repo: str, dry_run: bool
-) -> list[str]:
-    cmd = [sys.executable, str(BB_SCRIPT), repo, *build_common_args(args)]
-    if args.recipe:
-        cmd.extend(["--recipe", args.recipe])
-    if args.srcrev:
-        cmd.extend(["--srcrev", args.srcrev])
-    if args.base_existing:
-        cmd.append("--base-existing")
-    if args.no_commit:
-        cmd.append("--no-commit")
-    if dry_run:
-        cmd.append("-n")
-    return cmd
-
-
-def build_xml_cmd(
-    args: argparse.Namespace,
-    project: str,
-    dry_run: bool,
-    revision: str | None = None,
-) -> list[str]:
-    cmd = [
-        sys.executable,
-        str(XML_SCRIPT),
-        project,
-        *build_common_args(args),
-    ]
-    if args.manifest:
-        cmd.extend(["--manifest", args.manifest])
-    if revision:
-        cmd.extend(["--revision", revision])
-    elif args.srcrev:
-        cmd.extend(["--revision", args.srcrev])
-    cmd.append("--no-commit")
-    if dry_run:
-        cmd.append("-n")
-    return cmd
+    commit_or_amend(
+        repo, rel, message, is_revision_only_diff, quiet=True
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -316,15 +1018,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--workspace",
-        help="Repo workspace root (default: auto-detect in child scripts)",
+        help="Repo workspace root (default: auto-detect)",
     )
     parser.add_argument(
         "--recipe",
-        help="Recipe .bb/.inc path override for BB step",
+        help="Recipe .bb/.inc path override",
     )
     parser.add_argument(
         "--manifest",
-        help="Manifest path override for XML steps",
+        help="Manifest path override",
     )
     parser.add_argument(
         "--srcrev",
@@ -359,105 +1061,106 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    cwd = Path.cwd()
+    workspace = (
+        Path(args.workspace).resolve()
+        if args.workspace
+        else find_workspace_root(cwd)
+    )
+    manifest = (
+        Path(args.manifest).resolve()
+        if args.manifest
+        else (workspace / "default.xml").resolve()
+    )
 
-    if not BB_SCRIPT.is_file():
-        raise SystemExit(f"ERROR: BB script not found: {BB_SCRIPT}")
-    if not XML_SCRIPT.is_file():
-        raise SystemExit(f"ERROR: XML script not found: {XML_SCRIPT}")
-
-    repo = args.repo
-
-    code, bb_out = run_step(
-        "recipe SRCREV",
-        build_bb_cmd(args, repo, True),
+    recipe = update_recipe(args, workspace, dry_run=True)
+    source_pin = update_manifest_pin(
+        workspace,
+        manifest,
+        args.repo,
+        args.srcrev,
         dry_run=True,
     )
-    if code != 0:
-        eprint(f"ERROR: recipe SRCREV dry-run failed (exit {code})")
-        print("RESULT: aborted before apply", flush=True)
-        return code
-
-    meta_layer, meta_head = parse_bb_meta(bb_out)
-
-    xml_source_cmd_dry = build_xml_cmd(args, repo, True)
-    xml_meta_cmd_dry = build_xml_cmd(
-        args, meta_layer, True, revision=meta_head
+    recipe_pin = update_manifest_pin(
+        workspace,
+        manifest,
+        recipe.meta_rel,
+        recipe.meta_head,
+        dry_run=True,
+    )
+    pins = [source_pin, recipe_pin]
+    pushes = collect_pushes(
+        recipe.push_hints, source_pin.push_hints, recipe_pin.push_hints
     )
 
-    xml_outs: list[str] = []
-    for label, cmd in (
-        ("manifest source project", xml_source_cmd_dry),
-        ("manifest recipe project", xml_meta_cmd_dry),
-    ):
-        code, xml_out = run_step(label, cmd, dry_run=True)
-        if code != 0:
-            eprint(f"ERROR: {label} dry-run failed (exit {code})")
-            print("RESULT: aborted before apply", flush=True)
-            return code
-        xml_outs.append(xml_out)
-
     if args.dry_run:
-        if xml_changed(*xml_outs):
-            print(
-                "INFO: would use one default.xml commit "
-                "(amend if HEAD only changed revision attrs)",
-                flush=True,
-            )
-        print("RESULT: dry-run complete for all requested steps", flush=True)
-        print_pushes(collect_pushes(bb_out, *xml_outs), dry_run=True)
+        print_report(recipe, source_pin, recipe_pin, dry_run=True)
+        print_pushes(pushes)
         return 0
 
     applied: list[str] = []
+    try:
+        recipe = update_recipe(args, workspace, dry_run=False)
+        applied.append("recipe SRCREV")
+        source_pin = update_manifest_pin(
+            workspace,
+            manifest,
+            args.repo,
+            args.srcrev,
+            dry_run=False,
+        )
+        applied.append("manifest source project")
+        recipe_pin = update_manifest_pin(
+            workspace,
+            manifest,
+            recipe.meta_rel,
+            recipe.meta_head,
+            dry_run=False,
+        )
+        applied.append("manifest recipe project")
+    except SystemExit as exc:
+        code = exc.code if isinstance(exc.code, int) else 1
+        if isinstance(exc.code, str) and exc.code:
+            eprint(exc.code)
+            code = 1
+        eprint("ERROR: apply failed")
+        if applied:
+            eprint(
+                "WARNING: partial apply; earlier steps may have "
+                "committed: " + ", ".join(applied)
+            )
+        print_report(
+            recipe,
+            source_pin,
+            recipe_pin,
+            dry_run=False,
+            applied=applied,
+            incomplete=True,
+        )
+        print_pushes(pushes)
+        return code if code else 1
 
-    code, bb_out = run_step(
-        "recipe SRCREV",
-        build_bb_cmd(args, repo, False),
-        dry_run=False,
+    pins = [source_pin, recipe_pin]
+    pushes = collect_pushes(
+        recipe.push_hints, source_pin.push_hints, recipe_pin.push_hints
     )
-    if code != 0:
-        eprint(f"ERROR: recipe SRCREV apply failed (exit {code})")
-        print("RESULT: apply incomplete", flush=True)
-        return code
-    applied.append("recipe SRCREV")
-    meta_layer, meta_head = parse_bb_meta(bb_out)
-
-    apply_xml: list[tuple[str, list[str]]] = [
-        (
-            "manifest source project",
-            build_xml_cmd(args, repo, False),
-        ),
-        (
-            "manifest recipe project",
-            build_xml_cmd(args, meta_layer, False, revision=meta_head),
-        ),
-    ]
-    xml_outs: list[str] = []
-    for label, cmd in apply_xml:
-        code, xml_out = run_step(label, cmd, dry_run=False)
-        if code != 0:
-            eprint(f"ERROR: {label} apply failed (exit {code})")
-            if applied:
-                eprint(
-                    "WARNING: partial apply; earlier steps may have "
-                    "committed: " + ", ".join(applied)
-                )
-            print("RESULT: apply incomplete", flush=True)
-            print_pushes(collect_pushes(bb_out, *xml_outs), dry_run=False)
-            return code
-        applied.append(label)
-        xml_outs.append(xml_out)
 
     if not args.no_commit:
-        print("=== manifest commit (apply) ===", flush=True)
-        commit_manifest_bundle(args, bb_out, xml_outs)
-        print(flush=True)
+        commit_manifest_bundle(args, workspace, recipe, pins)
         applied.append("manifest commit")
 
-    targets = " and ".join(applied)
-    print(f"RESULT: apply complete ({targets})", flush=True)
-    print_pushes(collect_pushes(bb_out, *xml_outs), dry_run=False)
+    print_report(
+        recipe, source_pin, recipe_pin, dry_run=False, applied=applied
+    )
+    print_pushes(pushes)
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except subprocess.CalledProcessError as exc:
+        eprint(f"ERROR: git command failed: {' '.join(exc.cmd)}")
+        if exc.stderr:
+            eprint(exc.stderr.strip())
+        raise SystemExit(1) from exc

@@ -9,14 +9,60 @@ from __future__ import annotations
 
 import re
 import subprocess
+import sys
 from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
 
+ISSUE_RE = re.compile(r"[A-Z][A-Z0-9]*-\d+")
 REVISION_ATTR = re.compile(r'\brevision="[^"]*"')
 SRCREV_LINE = re.compile(
     r'^(SRCREV(?:_[\w-]+)?)(\s*(?:\?=|=)\s*)"[0-9a-fA-F]{7,40}"'
 )
+
+
+def eprint(msg: str) -> None:
+    print(msg, file=sys.stderr)
+
+
+def is_git_repo(path: Path) -> bool:
+    return (path / ".git").exists()
+
+
+def workspace_rel(path: Path, workspace: Path) -> str:
+    resolved = path.resolve()
+    root = workspace.resolve()
+    if resolved == root:
+        return "."
+    try:
+        return str(resolved.relative_to(root))
+    except ValueError:
+        return str(resolved)
+
+
+def git_try(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def git_ref_exists(repo: Path, ref: str) -> bool:
+    return git_try(["show-ref", "--verify", "--quiet", ref], repo).returncode == 0
+
+
+def extract_issue(*repos: Path) -> str | None:
+    for repo in repos:
+        result = git_try(["branch", "--show-current"], repo)
+        if result.returncode != 0:
+            continue
+        match = ISSUE_RE.search(result.stdout.strip())
+        if match:
+            return match.group(0)
+    return None
 
 
 def run_git(args: list[str], cwd: Path) -> str:
@@ -144,6 +190,8 @@ def commit_or_amend(
     rel: str,
     message: str,
     predicate: Callable[[str], bool],
+    *,
+    quiet: bool = False,
 ) -> str:
     """Commit rel, or amend HEAD if HEAD is a matching skill-only commit.
 
@@ -153,7 +201,7 @@ def commit_or_amend(
     subject, sep, body = message.partition("\n\n")
     cmd = ["commit"]
     if amend:
-        if head_equals_upstream(repo):
+        if head_equals_upstream(repo) and not quiet:
             print(
                 "INFO: amending a commit that matches origin; "
                 "push may need --force-with-lease"
@@ -165,5 +213,6 @@ def commit_or_amend(
     cmd.extend(["--only", "--", rel])
     run_git(cmd, repo)
     kind = "amended" if amend else "committed"
-    print(f"INFO: {kind} in {repo}: {subject}")
+    if not quiet:
+        print(f"INFO: {kind} in {repo}: {subject}")
     return kind
