@@ -173,17 +173,24 @@ Step 3 — Manifest recipe project
   • Project: meta-judo-proprietary → oe/meta-judo-proprietary at dd17e9581e34a608830123ded24e366763e724cb
   • Outcome: default.xml revision already matches meta-layer HEAD — no change
 
+
 Final result
 
   RESULT: dry-run complete for all requested steps
 
   Everything is already in sync, so an apply run would make no commits or file changes.
 
+
 Push hints (informational only — not executed)
 
-  src/mqtt-api: git push origin feature/SUMO-588_func_test_flicker
-  oe/meta-judo-proprietary: git push origin feature/SUMO-588_func_test_flicker
-  .: git push origin feature/SUMO-588_func_test_flicker
+  • src/mqtt-api:
+    git push origin feature/SUMO-588_func_test_flicker
+  • oe/meta-judo-proprietary: remote already in sync
+  • .: remote already in sync
+
+Push warnings (local vs origin; informational only)
+
+  • src/mqtt-api: origin/feature/SUMO-588_func_test_flicker does not exist yet (first push for this repo)
 ```
 
 `.` is the manifest git repo (workspace root).

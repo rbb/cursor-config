@@ -36,6 +36,7 @@ from skill_git import (
     is_srcrev_only_diff,
     path_is_dirty,
     push_branch_warnings,
+    push_needed,
     repo_is_dirty,
     run_git,
     workspace_rel,
@@ -53,6 +54,13 @@ REVISION_ATTR_START = re.compile(r'\brevision="')
 
 
 @dataclass
+class PushHint:
+    rel: str
+    repo: Path
+    branch: str
+
+
+@dataclass
 class RecipeResult:
     src_rel: str
     src_branch: str
@@ -65,7 +73,7 @@ class RecipeResult:
     old_rev: str
     changed: bool
     outcome: str
-    push_hints: list[str] = field(default_factory=list)
+    push_hints: list[PushHint] = field(default_factory=list)
     issue: str | None = None
 
 
@@ -77,7 +85,7 @@ class ManifestPinResult:
     new_revision: str
     changed: bool
     outcome: str
-    push_hints: list[str] = field(default_factory=list)
+    push_hints: list[PushHint] = field(default_factory=list)
     manifest_rel: str = "default.xml"
 
 
@@ -675,8 +683,8 @@ def update_recipe(
     meta_rel = recipe_display_path(meta_repo, workspace)
     src_rel = recipe_display_path(src_repo, workspace)
     pushes = [
-        f"{src_rel}: git push origin {src_branch}",
-        f"{meta_rel}: git push origin {src_branch}",
+        PushHint(rel=src_rel, repo=src_repo, branch=src_branch),
+        PushHint(rel=meta_rel, repo=meta_repo, branch=src_branch),
     ]
 
     if dry_run and preflight:
@@ -962,10 +970,14 @@ def update_manifest_pin(
     )
     manifest_repo_rel = workspace_rel(manifest_repo, workspace)
     manifest_branch = run_git(["branch", "--show-current"], manifest_repo)
-    pushes: list[str] = []
+    pushes: list[PushHint] = []
     if manifest_branch:
         pushes.append(
-            f"{manifest_repo_rel}: git push origin {manifest_branch}"
+            PushHint(
+                rel=manifest_repo_rel,
+                repo=manifest_repo,
+                branch=manifest_branch,
+            )
         )
 
     already = old_revision == new_revision
@@ -1020,19 +1032,25 @@ def update_manifest_pin(
 # --- orchestrator ---
 
 
-def print_pushes(
-    lines: list[str], warnings: list[str] | None = None
-) -> None:
+def print_pushes(hints: list[PushHint]) -> None:
     """Print suggested push commands. Never run git push."""
-    if not lines:
+    if not hints:
         return
     print("Push hints (informational only — not executed)")
     print()
-    for line in lines:
-        print(f"  {line}")
+    warnings: list[str] = []
+    for hint in hints:
+        if push_needed(hint.repo, hint.branch):
+            print(f"  • {hint.rel}:")
+            print(f"    git push origin {hint.branch}")
+            for warning in push_branch_warnings(hint.repo, hint.branch):
+                warnings.append(f"{hint.rel}: {warning}")
+        else:
+            print(f"  • {hint.rel}: remote already in sync")
     if warnings:
         print()
-        print("  Push warnings (local vs origin; informational only)")
+        print("Push warnings (local vs origin; informational only)")
+        print()
         for warning in warnings:
             print(f"  • {warning}")
     print()
@@ -1103,6 +1121,7 @@ def print_report(
             f"Outcome: {recipe_outcome}",
         ],
     )
+    print()
     print("Final result")
     print()
     if incomplete:
@@ -1130,30 +1149,16 @@ def print_report(
     print()
 
 
-def collect_pushes(*groups: list[str]) -> list[str]:
-    seen: set[str] = set()
-    lines: list[str] = []
+def collect_push_hints(*groups: list[PushHint]) -> list[PushHint]:
+    seen: set[tuple[str, str]] = set()
+    hints: list[PushHint] = []
     for group in groups:
         for hint in group:
-            if hint not in seen:
-                seen.add(hint)
-                lines.append(hint)
-    return lines
-
-
-def collect_push_warnings(
-    ctx: SkillContext, branch: str
-) -> list[str]:
-    """Warnings when local branches may not match origin."""
-    warnings: list[str] = []
-    for repo, rel in (
-        (ctx.src_repo, ctx.src_rel),
-        (ctx.meta_repo, ctx.meta_rel),
-        (ctx.manifest_repo, ctx.manifest_repo_rel),
-    ):
-        for warning in push_branch_warnings(repo, branch):
-            warnings.append(f"{rel}: {warning}")
-    return warnings
+            key = (hint.rel, hint.branch)
+            if key not in seen:
+                seen.add(key)
+                hints.append(hint)
+    return hints
 
 
 def issue_for_manifest(
@@ -1344,15 +1349,14 @@ def main() -> int:
         dry_run=True,
     )
     pins = [source_pin, recipe_pin]
-    pushes = collect_pushes(
+    push_hints = collect_push_hints(
         recipe.push_hints, source_pin.push_hints, recipe_pin.push_hints
     )
-    push_warnings = collect_push_warnings(ctx, ctx.src_branch)
 
     if args.dry_run:
         print_preflight(preflight)
         print_report(recipe, source_pin, recipe_pin, dry_run=True)
-        print_pushes(pushes, push_warnings)
+        print_pushes(push_hints)
         return 0
 
     run_preflight(ctx, args, dry_run=False)
@@ -1397,14 +1401,13 @@ def main() -> int:
             applied=applied,
             incomplete=True,
         )
-        print_pushes(pushes, push_warnings)
+        print_pushes(push_hints)
         return code if code else 1
 
     pins = [source_pin, recipe_pin]
-    pushes = collect_pushes(
+    push_hints = collect_push_hints(
         recipe.push_hints, source_pin.push_hints, recipe_pin.push_hints
     )
-    push_warnings = collect_push_warnings(ctx, ctx.src_branch)
 
     if not args.no_commit:
         commit_manifest_bundle(args, workspace, recipe, pins)
@@ -1414,7 +1417,7 @@ def main() -> int:
     print_report(
         recipe, source_pin, recipe_pin, dry_run=False, applied=applied
     )
-    print_pushes(pushes, push_warnings)
+    print_pushes(push_hints)
     return 0
 
 

@@ -113,6 +113,19 @@ def current_branch(repo: Path) -> str:
     return run_git(["branch", "--show-current"], repo)
 
 
+def push_needed(repo: Path, branch: str) -> bool:
+    """True when local branch is not already on origin."""
+    local_ref = f"refs/heads/{branch}"
+    if not git_ref_exists(repo, local_ref):
+        return False
+    remote_ref = f"refs/remotes/origin/{branch}"
+    if not git_ref_exists(repo, remote_ref):
+        return True
+    local_sha = run_git(["rev-parse", local_ref], repo)
+    remote_sha = run_git(["rev-parse", remote_ref], repo)
+    return local_sha != remote_sha
+
+
 def push_branch_warnings(repo: Path, branch: str) -> list[str]:
     """Warnings for push hints when local branch may not match remote."""
     warnings: list[str] = []
