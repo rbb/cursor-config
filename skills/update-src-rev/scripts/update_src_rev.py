@@ -25,6 +25,7 @@ from pathlib import Path
 from skill_git import (
     ISSUE_RE,
     commit_or_amend,
+    current_branch,
     eprint,
     extract_issue,
     find_workspace_root,
@@ -34,6 +35,8 @@ from skill_git import (
     is_revision_only_diff,
     is_srcrev_only_diff,
     path_is_dirty,
+    push_branch_warnings,
+    repo_is_dirty,
     run_git,
     workspace_rel,
 )
@@ -76,6 +79,280 @@ class ManifestPinResult:
     outcome: str
     push_hints: list[str] = field(default_factory=list)
     manifest_rel: str = "default.xml"
+
+
+@dataclass
+class RepoPreflightLine:
+    label: str
+    rel: str
+    branch: str
+    note: str
+
+
+@dataclass
+class PreflightResult:
+    source_branch: str
+    lines: list[RepoPreflightLine] = field(default_factory=list)
+    meta_planned_head: str = ""
+    meta_note: str = ""
+
+
+@dataclass
+class SkillContext:
+    workspace: Path
+    manifest: Path
+    src_repo: Path
+    meta_repo: Path
+    manifest_repo: Path
+    src_branch: str
+    src_rel: str
+    meta_rel: str
+    manifest_repo_rel: str
+
+
+# --- pre-flight ---
+
+
+def preflight_exit(paragraphs: list[str]) -> None:
+    """Stop for agent AskQuestion; never mutate repos."""
+    eprint("PREFLIGHT: action required")
+    eprint("")
+    for block in paragraphs:
+        eprint(block)
+        eprint("")
+    raise SystemExit(2)
+
+
+def branch_start_point(
+    repo: Path, base_existing: bool
+) -> tuple[str, str]:
+    """Return (start_ref, sha) for a new branch from main or current."""
+    if base_existing:
+        current = current_branch(repo)
+        start_ref = current if current else "HEAD"
+        sha = run_git(["rev-parse", "HEAD"], repo)
+        return start_ref, sha
+    if git_ref_exists(repo, "refs/remotes/origin/main"):
+        sha = run_git(["rev-parse", "refs/remotes/origin/main"], repo)
+        return "origin/main", sha
+    if git_ref_exists(repo, "refs/heads/main"):
+        sha = run_git(["rev-parse", "refs/heads/main"], repo)
+        return "main", sha
+    raise SystemExit(
+        "ERROR: no main or origin/main; pass --base-existing or fetch main"
+    )
+
+
+def branch_alignment_plan(
+    repo: Path,
+    target_branch: str,
+    base_existing: bool,
+    dry_run: bool,
+) -> tuple[str, str]:
+    """Plan or apply branch alignment. Return (HEAD SHA, human note)."""
+    current = current_branch(repo)
+    if not current:
+        raise SystemExit(
+            "ERROR: detached HEAD; check out a named branch before continuing"
+        )
+
+    if current == target_branch:
+        sha = run_git(["rev-parse", "HEAD"], repo)
+        return sha, "already on matching branch"
+
+    local_ref = f"refs/heads/{target_branch}"
+    remote_ref = f"refs/remotes/origin/{target_branch}"
+
+    if git_ref_exists(repo, local_ref):
+        sha = run_git(["rev-parse", local_ref], repo)
+        if dry_run:
+            return sha, f"would checkout existing branch {target_branch}"
+        run_git(["checkout", target_branch], repo)
+        return run_git(["rev-parse", "HEAD"], repo), (
+            f"checked out existing branch {target_branch}"
+        )
+
+    if git_ref_exists(repo, remote_ref):
+        sha = run_git(["rev-parse", remote_ref], repo)
+        if dry_run:
+            return sha, f"would checkout existing origin/{target_branch}"
+        run_git(
+            ["checkout", "-B", target_branch, f"origin/{target_branch}"],
+            repo,
+        )
+        return run_git(["rev-parse", "HEAD"], repo), (
+            f"checked out existing origin/{target_branch}"
+        )
+
+    start_ref, sha = branch_start_point(repo, base_existing)
+    if dry_run:
+        return sha, f"would create branch {target_branch} from {start_ref}"
+    run_git(["checkout", "-b", target_branch, start_ref], repo)
+    return run_git(["rev-parse", "HEAD"], repo), (
+        f"created branch {target_branch} from {start_ref}"
+    )
+
+
+def needs_branch_base_choice(
+    repo: Path, target_branch: str, base_existing: bool
+) -> bool:
+    """True when a new branch needs main vs current choice from the user."""
+    current = current_branch(repo)
+    if not current or current == target_branch:
+        return False
+    local_ref = f"refs/heads/{target_branch}"
+    remote_ref = f"refs/remotes/origin/{target_branch}"
+    if git_ref_exists(repo, local_ref) or git_ref_exists(repo, remote_ref):
+        return False
+    if current == "main":
+        return False
+    return not base_existing
+
+
+def run_preflight(
+    ctx: SkillContext,
+    args: argparse.Namespace,
+    dry_run: bool,
+) -> PreflightResult:
+    """Validate branch alignment and source cleanliness before steps 1–3."""
+    lines: list[RepoPreflightLine] = []
+    target = ctx.src_branch
+    meta_planned_head = run_git(["rev-parse", "HEAD"], ctx.meta_repo)
+    meta_note = "already on matching branch"
+
+    if repo_is_dirty(ctx.src_repo):
+        if not args.allow_dirty_source:
+            rel = ctx.src_rel
+            preflight_exit(
+                [
+                    (
+                        f"Source repo {rel} has uncommitted changes. "
+                        "The pin will use the current HEAD, which may "
+                        "include uncommitted work."
+                    ),
+                    (
+                        "Ask the user whether to continue. Re-run with "
+                        "--allow-dirty-source to pin the current HEAD, "
+                        "or commit/stash in the source repo first."
+                    ),
+                ]
+            )
+        lines.append(
+            RepoPreflightLine(
+                label="Source",
+                rel=ctx.src_rel,
+                branch=target,
+                note="has uncommitted changes (--allow-dirty-source)",
+            )
+        )
+    else:
+        lines.append(
+            RepoPreflightLine(
+                label="Source",
+                rel=ctx.src_rel,
+                branch=target,
+                note="clean",
+            )
+        )
+
+    for label, repo, rel in (
+        ("Meta layer", ctx.meta_repo, ctx.meta_rel),
+        ("Workspace", ctx.manifest_repo, ctx.manifest_repo_rel),
+    ):
+        current = current_branch(repo)
+        if not current:
+            raise SystemExit(
+                f"ERROR: {label} ({rel}) is on detached HEAD; "
+                "check out a named branch first"
+            )
+
+        if current != target:
+            if repo_is_dirty(repo):
+                preflight_exit(
+                    [
+                        (
+                            f"{label} ({rel}) is on {current} but the "
+                            f"source branch is {target}, and the repo "
+                            "has uncommitted changes."
+                        ),
+                        (
+                            "Commit or stash changes in that repo, then "
+                            "re-run the skill."
+                        ),
+                    ]
+                )
+
+            if needs_branch_base_choice(repo, target, args.base_existing):
+                preflight_exit(
+                    [
+                        (
+                            f"{label} ({rel}) is on {current} but the "
+                            f"source branch is {target}. Branch "
+                            f"{target} does not exist locally or on "
+                            "origin."
+                        ),
+                        (
+                            "Ask the user which base to use for the new "
+                            f"branch {target}:"
+                        ),
+                        (
+                            "  - main: re-run without --base-existing "
+                            "(default)"
+                        ),
+                        (
+                            f"  - current checkout ({current}): re-run "
+                            "with --base-existing"
+                        ),
+                    ]
+                )
+
+        head, note = branch_alignment_plan(
+            repo, target, args.base_existing, dry_run
+        )
+        line = RepoPreflightLine(
+            label=label,
+            rel=rel,
+            branch=target,
+            note=note,
+        )
+        lines.append(line)
+        if label == "Meta layer":
+            meta_planned_head = head
+            meta_note = note
+
+    return PreflightResult(
+        source_branch=target,
+        lines=lines,
+        meta_planned_head=meta_planned_head,
+        meta_note=meta_note,
+    )
+
+
+def resolve_skill_context(
+    args: argparse.Namespace, workspace: Path, manifest: Path
+) -> SkillContext:
+    """Resolve repos and branches used by pre-flight and the three steps."""
+    cwd = Path.cwd()
+    src_repo, layers = resolve_repos(args.repo, cwd, workspace)
+    recipe = resolve_recipe(
+        layers, src_repo.name, args.recipe, workspace
+    )
+    meta_repo = meta_repo_for_recipe(recipe)
+    manifest_repo = Path(
+        run_git(["rev-parse", "--show-toplevel"], manifest.parent)
+    )
+    src_branch = source_branch_name(src_repo)
+    return SkillContext(
+        workspace=workspace,
+        manifest=manifest,
+        src_repo=src_repo,
+        meta_repo=meta_repo,
+        manifest_repo=manifest_repo,
+        src_branch=src_branch,
+        src_rel=recipe_display_path(src_repo, workspace),
+        meta_rel=recipe_display_path(meta_repo, workspace),
+        manifest_repo_rel=recipe_display_path(manifest_repo, workspace),
+    )
 
 
 # --- recipe ---
@@ -352,77 +629,6 @@ def meta_repo_for_recipe(recipe: Path) -> Path:
     return Path(run_git(["rev-parse", "--show-toplevel"], recipe.parent))
 
 
-def recipe_branch_start_point(
-    meta_repo: Path, base_existing: bool
-) -> tuple[str, str]:
-    """Return (start_ref, sha) for a new recipe-repo branch."""
-    if base_existing:
-        current = run_git(["branch", "--show-current"], meta_repo)
-        start_ref = current if current else "HEAD"
-        sha = run_git(["rev-parse", "HEAD"], meta_repo)
-        return start_ref, sha
-    if git_ref_exists(meta_repo, "refs/remotes/origin/main"):
-        sha = run_git(["rev-parse", "refs/remotes/origin/main"], meta_repo)
-        return "origin/main", sha
-    if git_ref_exists(meta_repo, "refs/heads/main"):
-        sha = run_git(["rev-parse", "refs/heads/main"], meta_repo)
-        return "main", sha
-    raise SystemExit(
-        "ERROR: no main or origin/main in recipe repo; "
-        "pass --base-existing or fetch main"
-    )
-
-
-def ensure_matching_branch(
-    meta_repo: Path,
-    branch: str,
-    dry_run: bool,
-    base_existing: bool,
-) -> tuple[str, str]:
-    """Checkout or create branch. Return (HEAD SHA, human note).
-
-    New branches start from origin/main (or main) unless base_existing.
-    """
-    local_ref = f"refs/heads/{branch}"
-    remote_ref = f"refs/remotes/origin/{branch}"
-    current = run_git(["branch", "--show-current"], meta_repo)
-
-    if current == branch:
-        sha = run_git(["rev-parse", "HEAD"], meta_repo)
-        return sha, "already on matching branch"
-
-    if git_ref_exists(meta_repo, local_ref):
-        sha = run_git(["rev-parse", local_ref], meta_repo)
-        if dry_run:
-            return sha, f"would checkout existing branch {branch}"
-        run_git(["checkout", branch], meta_repo)
-        return run_git(["rev-parse", "HEAD"], meta_repo), (
-            f"checked out existing branch {branch}"
-        )
-
-    if git_ref_exists(meta_repo, remote_ref):
-        sha = run_git(["rev-parse", remote_ref], meta_repo)
-        if dry_run:
-            return sha, f"would checkout existing origin/{branch}"
-        run_git(
-            ["checkout", "-B", branch, f"origin/{branch}"],
-            meta_repo,
-        )
-        return run_git(["rev-parse", "HEAD"], meta_repo), (
-            f"checked out existing origin/{branch}"
-        )
-
-    start_ref, sha = recipe_branch_start_point(
-        meta_repo, base_existing
-    )
-    if dry_run:
-        return sha, f"would create branch {branch} from {start_ref}"
-    run_git(["checkout", "-b", branch, start_ref], meta_repo)
-    return run_git(["rev-parse", "HEAD"], meta_repo), (
-        f"created branch {branch} from {start_ref}"
-    )
-
-
 def require_commit_in_source(src_repo: Path, sha: str) -> None:
     """Fail if sha is not a commit in the source repo history."""
     if not sha or sha == "?":
@@ -455,6 +661,7 @@ def update_recipe(
     args: argparse.Namespace,
     workspace: Path,
     dry_run: bool,
+    preflight: PreflightResult | None = None,
 ) -> RecipeResult:
     cwd = Path.cwd()
     src_repo, layers = resolve_repos(args.repo, cwd, workspace)
@@ -472,12 +679,15 @@ def update_recipe(
         f"{meta_rel}: git push origin {src_branch}",
     ]
 
-    meta_head, meta_note = ensure_matching_branch(
-        meta_repo,
-        src_branch,
-        dry_run,
-        args.base_existing,
-    )
+    if dry_run and preflight:
+        meta_head = preflight.meta_planned_head
+        meta_note = preflight.meta_note
+    else:
+        meta_head = run_git(["rev-parse", "HEAD"], meta_repo)
+        if current_branch(meta_repo) == src_branch:
+            meta_note = "already on matching branch"
+        else:
+            meta_note = f"on {current_branch(meta_repo)}"
     if not dry_run and not recipe.is_file():
         raise SystemExit(
             f"ERROR: recipe missing after checkout {src_branch}: "
@@ -810,7 +1020,9 @@ def update_manifest_pin(
 # --- orchestrator ---
 
 
-def print_pushes(lines: list[str]) -> None:
+def print_pushes(
+    lines: list[str], warnings: list[str] | None = None
+) -> None:
     """Print suggested push commands. Never run git push."""
     if not lines:
         return
@@ -818,6 +1030,21 @@ def print_pushes(lines: list[str]) -> None:
     print()
     for line in lines:
         print(f"  {line}")
+    if warnings:
+        print()
+        print("  Push warnings (local vs origin; informational only)")
+        for warning in warnings:
+            print(f"  • {warning}")
+    print()
+
+
+def print_preflight(preflight: PreflightResult) -> None:
+    print("Pre-flight — branch alignment")
+    print()
+    for line in preflight.lines:
+        print(
+            f"  • {line.label}: {line.rel} on {line.branch} ({line.note})"
+        )
     print()
 
 
@@ -912,6 +1139,21 @@ def collect_pushes(*groups: list[str]) -> list[str]:
                 seen.add(hint)
                 lines.append(hint)
     return lines
+
+
+def collect_push_warnings(
+    ctx: SkillContext, branch: str
+) -> list[str]:
+    """Warnings when local branches may not match origin."""
+    warnings: list[str] = []
+    for repo, rel in (
+        (ctx.src_repo, ctx.src_rel),
+        (ctx.meta_repo, ctx.meta_rel),
+        (ctx.manifest_repo, ctx.manifest_repo_rel),
+    ):
+        for warning in push_branch_warnings(repo, branch):
+            warnings.append(f"{rel}: {warning}")
+    return warnings
 
 
 def issue_for_manifest(
@@ -1046,8 +1288,16 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "Create a new recipe-repo branch from the current checkout "
-            "instead of main (default: False)"
+            "Create a new meta-layer or workspace branch from the current "
+            "checkout instead of main (default: False)"
+        ),
+    )
+    parser.add_argument(
+        "--allow-dirty-source",
+        action="store_true",
+        help=(
+            "Continue when the source repo has uncommitted changes "
+            "(pins current HEAD)"
         ),
     )
     parser.add_argument(
@@ -1073,7 +1323,12 @@ def main() -> int:
         else (workspace / "default.xml").resolve()
     )
 
-    recipe = update_recipe(args, workspace, dry_run=True)
+    ctx = resolve_skill_context(args, workspace, manifest)
+    preflight = run_preflight(ctx, args, dry_run=True)
+
+    recipe = update_recipe(
+        args, workspace, dry_run=True, preflight=preflight
+    )
     source_pin = update_manifest_pin(
         workspace,
         manifest,
@@ -1092,11 +1347,16 @@ def main() -> int:
     pushes = collect_pushes(
         recipe.push_hints, source_pin.push_hints, recipe_pin.push_hints
     )
+    push_warnings = collect_push_warnings(ctx, ctx.src_branch)
 
     if args.dry_run:
+        print_preflight(preflight)
         print_report(recipe, source_pin, recipe_pin, dry_run=True)
-        print_pushes(pushes)
+        print_pushes(pushes, push_warnings)
         return 0
+
+    run_preflight(ctx, args, dry_run=False)
+    preflight = run_preflight(ctx, args, dry_run=True)
 
     applied: list[str] = []
     try:
@@ -1137,22 +1397,24 @@ def main() -> int:
             applied=applied,
             incomplete=True,
         )
-        print_pushes(pushes)
+        print_pushes(pushes, push_warnings)
         return code if code else 1
 
     pins = [source_pin, recipe_pin]
     pushes = collect_pushes(
         recipe.push_hints, source_pin.push_hints, recipe_pin.push_hints
     )
+    push_warnings = collect_push_warnings(ctx, ctx.src_branch)
 
     if not args.no_commit:
         commit_manifest_bundle(args, workspace, recipe, pins)
         applied.append("manifest commit")
 
+    print_preflight(preflight)
     print_report(
         recipe, source_pin, recipe_pin, dry_run=False, applied=applied
     )
-    print_pushes(pushes)
+    print_pushes(pushes, push_warnings)
     return 0
 
 

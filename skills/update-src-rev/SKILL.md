@@ -38,30 +38,35 @@ this skill covers both plus the meta-layer branch and recipe SHA pin.
 
 Recipe files always live under `oe/meta-judo*`, never under `src/`.
 
-## Meta-layer branch
+## Pre-flight — branch alignment
 
-Before writing SRCREV, step 1 uses the **current branch name** of the
-source repo:
+Before steps 1–3, the script aligns the **meta-layer** and **workspace**
+(manifest) repos to the **source repo branch name**:
 
-1. If the meta-layer repo already has that branch locally, check it out.
+1. If the repo already has that branch locally, check it out.
 2. Else if `origin/<branch>` exists, check it out as a local branch.
-3. Else create a new branch with that name from **`origin/main`** (or
-   local `main` if origin is missing).
+3. Else create a new branch from **`origin/main`** (or local `main`).
+   When the repo is not on `main`, the script stops with
+   `PREFLIGHT: action required` so the agent can ask whether the new
+   branch should be based on `main` or the current checkout.
 
-To create the new recipe-repo branch from the **current checkout**
-instead of `main`, pass `--base-existing`:
+To base new branches on the **current checkout** instead of `main`,
+pass `--base-existing` (applies to both meta-layer and workspace):
 
 ```bash
 python3 .agents/skills/update-src-rev/scripts/update_src_rev.py \
   mqtt-api --base-existing
 ```
 
-Example: if `oe/meta-judo-proprietary` is on `feature/old` and the
-source branch is `feature/SUMO-588_func_test_flicker` with no matching
-meta branch yet, default is
-`git checkout -b feature/SUMO-588_func_test_flicker origin/main`.
+Example: workspace on `feature/old`, source on
+`feature/SUMO-588_func_test_flicker`, no matching branch yet — default
+is `git checkout -b feature/SUMO-588_func_test_flicker origin/main`.
 With `--base-existing` it is
 `git checkout -b feature/SUMO-588_func_test_flicker feature/old`.
+
+Only **local** branches are considered; server sync is the user's
+responsibility. Push hints may include warnings when `origin/<branch>`
+is missing or differs from local.
 
 Then stage and commit the recipe (unless SRCREV already matches, or
 `--no-commit` / `-n`).
@@ -77,9 +82,14 @@ or switch this matching branch.
 ## Preconditions
 
 1. Google Repo workspace (`.repo/` or `default.xml` + `oe/`).
-2. Feature branch checked out in the **source** repo. Manifest repo
-   should already be on the intended feature branch.
+2. Feature branch checked out in the **source** repo (not detached
+   HEAD). Meta-layer and workspace (manifest) repos are aligned to that
+   same branch name during pre-flight (checkout, or create from `main`
+   / current checkout per user choice).
 3. Issue id in a branch name or `--issue`.
+4. When a branch switch is required, meta-layer and workspace repos
+   must be **clean** (commit or stash first). A dirty **source** repo
+   stops pre-flight unless the user confirms via `--allow-dirty-source`.
 
 ## Script location
 
@@ -98,8 +108,9 @@ Git commit/amend helpers live in `scripts/skill_git.py` (imported, not a CLI).
 | `--srcrev` | SHA for recipe and source pin (default: source `HEAD`). |
 | `--issue` | Issue id for commit messages. |
 | `--no-commit` | Update files only; no commits. |
-| `--base-existing` | New recipe-repo branch from current checkout, not `main`. |
-| `-n` / `--dry-run` | Dry-run only; do not write or commit. |
+| `--base-existing` | New meta-layer/workspace branch from current checkout, not `main`. |
+| `--allow-dirty-source` | Pin source `HEAD` despite uncommitted source changes. |
+| `-n` / `--dry-run` | Dry-run only; do not write, commit, or switch branches. |
 
 Without `-n`, the script **always dry-runs all steps first**, then
 applies only if every dry-run succeeds.
@@ -132,13 +143,19 @@ python3 ../../.agents/skills/update-src-rev/scripts/update_src_rev.py \
 
 ## Output
 
-The script prints **three steps**, a **final result**, then **push hints**.
-The agent should show this output as-is (or paste it), not rewrite it
-into a different outline.
+The script prints **pre-flight**, **three steps**, a **final result**, then
+**push hints** (with optional push warnings). The agent should show this
+output as-is (or paste it), not rewrite it into a different outline.
 
 **Dry run** (`-n`), already in sync:
 
 ```text
+Pre-flight — branch alignment
+
+  • Source: src/mqtt-api on feature/SUMO-588_func_test_flicker (clean)
+  • Meta layer: oe/meta-judo-proprietary on feature/SUMO-588_func_test_flicker (already on matching branch)
+  • Workspace: . on feature/SUMO-588_func_test_flicker (already on matching branch)
+
 Step 1 — Recipe SRCREV
 
   • Source: src/mqtt-api on feature/SUMO-588_func_test_flicker at 677be58940df4087e254c4bb4cf0a95768f6eaa2
@@ -221,12 +238,16 @@ When the user wants this operation:
 1. **Read** this skill.
 2. Confirm the **source repo** name. Ask if unclear.
 3. Run `update_src_rev.py` with `-n` first; show the script output
-   (three steps + final result + push hints) without rewriting the
-   layout.
-4. On success, run without `-n` unless the user asked for dry-run only.
-5. **Report** that same three-step layout from the script. Include the
-   push hints (relative directory + `git push origin <branch>`).
-6. **Never push.** Do not run `git push` in any repo. Listing the
+   (pre-flight + three steps + final result + push hints) without
+   rewriting the layout.
+4. If the script exits with **`PREFLIGHT: action required`** (exit
+   code 2), use **AskQuestion** to resolve (dirty source, dirty
+   meta/workspace before switch, or `main` vs current checkout for a
+   new branch), then re-run with the appropriate flags.
+5. On success, run without `-n` unless the user asked for dry-run only.
+6. **Report** that same layout from the script. Include push hints and
+   any push warnings.
+7. **Never push.** Do not run `git push` in any repo. Listing the
    hints is the whole push-related output.
 
 ## Partial failure
@@ -241,7 +262,11 @@ retry blindly; inspect git state in both repos before re-running.
 | Situation | Action |
 |-----------|--------|
 | Missing repo argument | Pass repo name (e.g. `mqtt-api`). |
-| Detached HEAD in source | Check out a named branch first. |
+| `PREFLIGHT: action required` | AskQuestion; re-run with flags or after stash. |
+| Dirty source repo | Ask user; `--allow-dirty-source` or clean source. |
+| Dirty meta/workspace before switch | Commit or stash; re-run. |
+| New branch, not on `main` | Ask `main` vs current; `--base-existing` for current. |
+| Detached HEAD | Check out a named branch first. |
 | Multiple recipes match | List paths; ask which `--recipe`. |
 | No issue in branch name | Ask for issue id or pass `--issue`. |
 | SRCREV already matches | Skip recipe commit; still do branch + XML. |

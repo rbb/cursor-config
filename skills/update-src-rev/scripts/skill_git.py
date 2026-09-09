@@ -102,6 +102,39 @@ def path_is_dirty(repo: Path, rel: str) -> bool:
     return bool(out.strip())
 
 
+def repo_is_dirty(repo: Path) -> bool:
+    """True when the repo has any uncommitted changes."""
+    out = run_git(["status", "--porcelain"], repo)
+    return bool(out.strip())
+
+
+def current_branch(repo: Path) -> str:
+    """Return the current branch name, or empty string on detached HEAD."""
+    return run_git(["branch", "--show-current"], repo)
+
+
+def push_branch_warnings(repo: Path, branch: str) -> list[str]:
+    """Warnings for push hints when local branch may not match remote."""
+    warnings: list[str] = []
+    remote_ref = f"refs/remotes/origin/{branch}"
+    if not git_ref_exists(repo, remote_ref):
+        warnings.append(
+            f"origin/{branch} does not exist yet (first push for this repo)"
+        )
+        return warnings
+    local_ref = f"refs/heads/{branch}"
+    if not git_ref_exists(repo, local_ref):
+        return warnings
+    local_sha = run_git(["rev-parse", local_ref], repo)
+    remote_sha = run_git(["rev-parse", remote_ref], repo)
+    if local_sha != remote_sha:
+        warnings.append(
+            f"local {branch} differs from origin/{branch}; "
+            "push may need --force-with-lease"
+        )
+    return warnings
+
+
 def parse_unified_diff(
     diff: str,
 ) -> tuple[list[str], list[str], list[str]]:
