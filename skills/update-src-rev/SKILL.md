@@ -38,10 +38,34 @@ this skill covers both plus the meta-layer branch and recipe SHA pin.
 
 Recipe files always live under `oe/meta-judo*`, never under `src/`.
 
-## Pre-flight — branch alignment
+## Pre-flight — branch alignment and main freshness
 
-Before steps 1–3, the script aligns the **meta-layer** and **workspace**
-(manifest) repos to the **source repo branch name**:
+Before steps 1–3, the script checks the `main` branch in the source,
+meta-layer, and workspace repositories against `origin/main`. It also
+verifies that the source branch name contains no underscores.
+
+If a main branch is behind or missing, fixing fetches `origin/main` and
+fast-forwards or creates local `main`. A diverged main branch must be
+resolved manually.
+
+If the source branch contains underscores, fixing renames the current
+local source, meta-layer, and workspace branches when possible. The
+remote branch is not renamed or pushed.
+
+When a check fails, the agent must use `AskQuestion` and offer:
+
+- `yes`: pass `--fix-preflight` and let the skill make the fixes.
+- `abort`: stop the skill without changing anything.
+- `continue`: pass `--continue-preflight` and continue unchanged.
+
+The agent must also accept `y` for `yes`, `a`, `no`, or `n` for
+`abort`, and `c` for `continue`.
+
+The default is to stop with `PREFLIGHT: action required`; never choose
+`continue` without the user's explicit choice.
+
+After these checks, the script aligns the **meta-layer** and
+**workspace** (manifest) repos to the **source repo branch name**:
 
 1. If the repo already has that branch locally, check it out.
 2. Else if `origin/<branch>` exists, check it out as a local branch.
@@ -110,6 +134,8 @@ Git commit/amend helpers live in `scripts/skill_git.py` (imported, not a CLI).
 | `--no-commit` | Update files only; no commits. |
 | `--base-existing` | New meta-layer/workspace branch from current checkout, not `main`. |
 | `--allow-dirty-source` | Pin source `HEAD` despite uncommitted source changes. |
+| `--fix-preflight` | Update local `main` branches and rename underscores. |
+| `--continue-preflight` | Continue with pre-flight issues unchanged. |
 | `-n` / `--dry-run` | Dry-run only; do not write, commit, or switch branches. |
 
 Without `-n`, the script **always dry-runs all steps first**, then
@@ -248,9 +274,12 @@ When the user wants this operation:
    (pre-flight + three steps + final result + push hints) without
    rewriting the layout.
 4. If the script exits with **`PREFLIGHT: action required`** (exit
-   code 2), use **AskQuestion** to resolve (dirty source, dirty
-   meta/workspace before switch, or `main` vs current checkout for a
-   new branch), then re-run with the appropriate flags.
+   code 2), use **AskQuestion**. For main freshness or underscore
+   problems, offer `yes` (`--fix-preflight`), `abort`, or `continue`
+   (`--continue-preflight`). For existing dirty-repo and new-branch
+   questions, resolve them as before, then re-run with the appropriate
+   flags. Accept `y` for yes, `a`, `no`, or `n` for abort, and `c` for
+   continue.
 5. On success, run without `-n` unless the user asked for dry-run only.
 6. **Report** that same layout from the script. Include push hints and
    any push warnings.
@@ -270,6 +299,8 @@ retry blindly; inspect git state in both repos before re-running.
 |-----------|--------|
 | Missing repo argument | Pass repo name (e.g. `mqtt-api`). |
 | `PREFLIGHT: action required` | AskQuestion; re-run with flags or after stash. |
+| Main is stale or diverged | Ask whether to fix, abort, or continue. |
+| Branch contains `_` | Ask whether to rename, abort, or continue. |
 | Dirty source repo | Ask user; `--allow-dirty-source` or clean source. |
 | Dirty meta/workspace before switch | Commit or stash; re-run. |
 | New branch, not on `main` | Ask `main` vs current; `--base-existing` for current. |

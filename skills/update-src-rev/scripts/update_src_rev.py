@@ -103,6 +103,7 @@ class PreflightResult:
     lines: list[RepoPreflightLine] = field(default_factory=list)
     meta_planned_head: str = ""
     meta_note: str = ""
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -149,6 +150,72 @@ def branch_start_point(
     raise SystemExit(
         "ERROR: no main or origin/main; pass --base-existing or fetch main"
     )
+
+
+def remote_main_sha(repo: Path) -> str:
+    """Return the current origin/main SHA, or an empty string."""
+    result = git_try(["ls-remote", "origin", "refs/heads/main"], repo)
+    if result.returncode != 0:
+        return ""
+    fields = result.stdout.strip().split()
+    return fields[0] if fields else ""
+
+
+def main_sync_issue(repo: Path) -> str | None:
+    """Describe why the local main branch is not current with origin."""
+    local_ref = "refs/heads/main"
+    local_exists = git_ref_exists(repo, local_ref)
+    remote_sha = remote_main_sha(repo)
+    if not remote_sha:
+        return "origin/main could not be read"
+    if not local_exists:
+        return "local main branch does not exist"
+    local_sha = run_git(["rev-parse", local_ref], repo)
+    if local_sha == remote_sha:
+        return None
+    if git_try(
+        ["merge-base", "--is-ancestor", local_sha, remote_sha], repo
+    ).returncode == 0:
+        return "local main is behind origin/main"
+    return "local main has diverged from origin/main"
+
+
+def update_local_main(repo: Path) -> None:
+    """Fetch origin/main and fast-forward the local main ref."""
+    result = git_try(["fetch", "origin", "main"], repo)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise SystemExit(f"ERROR: could not fetch origin/main: {detail}")
+    if not git_ref_exists(repo, "refs/heads/main"):
+        run_git(["branch", "main", "origin/main"], repo)
+        return
+    if current_branch(repo) == "main":
+        result = git_try(["merge", "--ff-only", "origin/main"], repo)
+        if result.returncode != 0:
+            raise SystemExit(
+                "ERROR: local main diverged from origin/main; "
+                "resolve it manually"
+            )
+        return
+    result = git_try(["branch", "--ff-only", "main", "origin/main"], repo)
+    if result.returncode != 0:
+        raise SystemExit(
+            "ERROR: local main diverged from origin/main; "
+            "resolve it manually"
+        )
+
+
+def rename_current_branch(repo: Path, old: str, new: str) -> None:
+    """Rename the current branch when it is the source branch."""
+    current = current_branch(repo)
+    if current != old or current == new:
+        return
+    if git_ref_exists(repo, f"refs/heads/{new}"):
+        raise SystemExit(
+            f"ERROR: cannot rename {old} to {new} in {repo}; "
+            "the destination branch already exists"
+        )
+    run_git(["branch", "-m", new], repo)
 
 
 def branch_alignment_plan(
@@ -224,7 +291,71 @@ def run_preflight(
 ) -> PreflightResult:
     """Validate branch alignment and source cleanliness before steps 1–3."""
     lines: list[RepoPreflightLine] = []
-    target = ctx.src_branch
+    original_target = ctx.src_branch
+    target = original_target
+    warnings: list[str] = []
+
+    main_issues: list[str] = []
+    for label, repo in (
+        ("Source repo", ctx.src_repo),
+        ("Meta layer", ctx.meta_repo),
+        ("Workspace", ctx.manifest_repo),
+    ):
+        issue = main_sync_issue(repo)
+        if issue:
+            main_issues.append(f"{label} ({repo}): {issue}")
+
+    if main_issues:
+        if args.fix_preflight and not dry_run:
+            for repo in (ctx.src_repo, ctx.meta_repo, ctx.manifest_repo):
+                update_local_main(repo)
+        elif args.fix_preflight:
+            warnings.extend(main_issues)
+        elif args.continue_preflight:
+            warnings.extend(main_issues)
+        else:
+            preflight_exit(
+                [
+                    "The following main branches are not up to date:",
+                    *[f"  - {issue}" for issue in main_issues],
+                    (
+                        "Ask the user whether to fix them (fetch and "
+                        "fast-forward main), abort, or continue without "
+                        "changes."
+                    ),
+                ]
+            )
+
+    if "_" in target:
+        replacement = target.replace("_", "-")
+        message = (
+            f"Source branch {target} contains underscores; "
+            f"the required branch name is {replacement}."
+        )
+        if args.fix_preflight:
+            if not dry_run:
+                for repo in (
+                    ctx.src_repo,
+                    ctx.meta_repo,
+                    ctx.manifest_repo,
+                ):
+                    rename_current_branch(repo, target, replacement)
+            target = replacement
+            warnings.append(message + f" Renaming to {replacement}.")
+        elif args.continue_preflight:
+            warnings.append(message)
+        else:
+            preflight_exit(
+                [
+                    message,
+                    (
+                        "Ask the user whether to rename the local branches, "
+                        "abort, or continue without changes."
+                    ),
+                ]
+            )
+
+    ctx.src_branch = target
     meta_planned_head = run_git(["rev-parse", "HEAD"], ctx.meta_repo)
     meta_note = "already on matching branch"
 
@@ -333,6 +464,7 @@ def run_preflight(
         lines=lines,
         meta_planned_head=meta_planned_head,
         meta_note=meta_note,
+        warnings=warnings,
     )
 
 
@@ -1059,6 +1191,10 @@ def print_pushes(hints: list[PushHint]) -> None:
 def print_preflight(preflight: PreflightResult) -> None:
     print("Pre-flight — branch alignment")
     print()
+    for warning in preflight.warnings:
+        print(f"  • Warning: {warning}")
+    if preflight.warnings:
+        print()
     for line in preflight.lines:
         print(
             f"  • {line.label}: {line.rel} on {line.branch} ({line.note})"
@@ -1306,12 +1442,30 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--fix-preflight",
+        action="store_true",
+        help=(
+            "Fetch and fast-forward main, and rename source branches "
+            "to replace underscores with hyphens"
+        ),
+    )
+    parser.add_argument(
+        "--continue-preflight",
+        action="store_true",
+        help="Continue despite preflight issues without changing them",
+    )
+    parser.add_argument(
         "-n",
         "--dry-run",
         action="store_true",
         help="Dry-run only; do not write or commit",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.fix_preflight and args.continue_preflight:
+        parser.error(
+            "--fix-preflight and --continue-preflight are mutually exclusive"
+        )
+    return args
 
 
 def main() -> int:
