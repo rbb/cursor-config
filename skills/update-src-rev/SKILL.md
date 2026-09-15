@@ -1,19 +1,32 @@
 ---
 name: update-src-rev
 description: >-
-  Pins a source-repo commit into the Yocto recipe and default.xml: updates
-  SRCREV, checks out or creates a matching branch in the recipe's meta-layer
-  repo, commits the recipe, then pins both the source SHA and the updated
-  recipe-repo SHA in default.xml. Use when preparing a PR branch, pinning a
-  source repo, or when the user mentions update-src-rev.
+  Pins commits into default.xml (and SRCREV when applicable). For src/<name>:
+  updates SRCREV, aligns the meta-layer branch, and pins source plus recipe
+  SHAs. For oe/meta-judo*: pins the layer HEAD in default.xml only. Supports
+  one repo or "for each of" multiple repos. Use when preparing a PR branch,
+  pinning a source or meta layer, or when the user mentions update-src-rev.
 disable-model-invocation: true
 ---
 
 # update-src-rev
 
-Pin a source-repo commit into the Yocto recipe **and** `default.xml`.
+Pin a commit into `default.xml` (and the Yocto recipe when a **source
+repo** is named).
 
-## What runs
+## Repo argument: `src/` vs `oe/`
+
+The script classifies each repo argument automatically:
+
+| Argument style | Example | Mode |
+|----------------|---------|------|
+| Source repo | `mqtt-api`, `src/mqtt-api` | Full skill (three steps) |
+| Meta layer | `meta-judo`, `oe/meta-judo-proprietary` | Manifest-only pin |
+
+**Do not** treat `oe/meta-judo*` as an error or ask how to proceed.
+Pass `meta-judo` (or `oe/meta-judo`) directly.
+
+### Source repo (`src/<name>`) — three steps
 
 | Step | Git repo | Artifact |
 |------|----------|----------|
@@ -24,6 +37,18 @@ Pin a source-repo commit into the Yocto recipe **and** `default.xml`.
 Step 1 reads the source SHA from the source repo `HEAD` (or `--srcrev`).
 Step 3 uses the meta-layer `HEAD` **after** the recipe commit (or after
 checking out the matching branch if SRCREV already matched).
+
+### Meta layer (`oe/meta-judo*`) — manifest-only
+
+| Step | Git repo | Artifact |
+|------|----------|----------|
+| Pre-flight | Meta layer + workspace | Align workspace to meta-layer branch |
+| 1–2 | — | Skipped (no source repo / SRCREV) |
+| 3 | Manifest (workspace root) | Meta-layer `<project revision>` → layer `HEAD` |
+
+Uses the meta-layer's **current branch** and **committed HEAD**. No
+carrier source repo is required. Amends the manifest commit when HEAD
+only changed `revision` attributes.
 
 The old `update-src-rev-bb` and `update-src-rev-xml` skills are retired;
 this skill covers both plus the meta-layer branch and recipe SHA pin.
@@ -106,14 +131,15 @@ or switch this matching branch.
 ## Preconditions
 
 1. Google Repo workspace (`.repo/` or `default.xml` + `oe/`).
-2. Feature branch checked out in the **source** repo (not detached
-   HEAD). Meta-layer and workspace (manifest) repos are aligned to that
-   same branch name during pre-flight (checkout, or create from `main`
-   / current checkout per user choice).
+2. **Source-repo mode:** feature branch checked out in the source repo
+   (not detached HEAD). Meta-layer and workspace align to that branch.
+   **Meta-layer mode:** feature branch checked out in the meta layer;
+   workspace aligns to that branch.
 3. Issue id in a branch name or `--issue`.
-4. When a branch switch is required, meta-layer and workspace repos
-   must be **clean** (commit or stash first). A dirty **source** repo
-   stops pre-flight unless the user confirms via `--allow-dirty-source`.
+4. When a branch switch is required, repos being switched must be
+   **clean** (commit or stash first). A dirty pin target (source repo in
+   source mode, meta layer in meta-layer mode) stops pre-flight unless
+   the user confirms via `--allow-dirty-source`.
 
 ## Script location
 
@@ -121,11 +147,38 @@ or switch this matching branch.
 
 Git commit/amend helpers live in `scripts/skill_git.py` (imported, not a CLI).
 
+## Multiple repositories
+
+`/update-src-rev for each of <repo_a> <repo_b> <repo_c>` runs the full
+skill once per named repo, in order. **Pre-flight (batch):** every named
+repo must be on the **same branch name** (source repos use their current
+branch; meta layers use the layer branch). If they differ, the script
+stops with `PREFLIGHT: action required` unless
+`--continue-preflight` is passed.
+
+Each per-repo run is otherwise independent: its own pre-flight, recipe
+SRCREV (when applicable), and manifest pins.
+
+The agent should pass every repo name to the script in one invocation
+(equivalent to running the skill on each repo separately):
+
+```bash
+python3 .agents/skills/update-src-rev/scripts/update_src_rev.py \
+  mqtt-api judo-rest-api cfg-mgr -n
+```
+
+Or run the script once per repo with the same flags. Do not merge repos
+into a single partial run.
+
+When more than one repo is requested, show the script output for each
+repo (including `Repository N of M` banners) without collapsing them
+into one summary.
+
 ## CLI
 
 | Flag | Meaning |
 |------|---------|
-| `repo` | **Required.** Name or path (`mqtt-api`, `src/mqtt-api`). |
+| `repo` … | **Required.** One or more names or paths. `src/<name>` or bare source name → three steps. `oe/meta-judo*` or bare meta name → manifest-only pin. Multiple repos run once each, in order. |
 | `--workspace` | Workspace root (default: auto-detect). |
 | `--recipe` | Recipe `.bb`/`.inc` override. |
 | `--manifest` | Manifest path override. |
@@ -157,6 +210,26 @@ python3 .agents/skills/update-src-rev/scripts/update_src_rev.py \
 cd /path/to/judo
 python3 .agents/skills/update-src-rev/scripts/update_src_rev.py \
   mqtt-api
+```
+
+**Meta layer only (manifest pin):**
+
+```bash
+cd /path/to/judo
+python3 .agents/skills/update-src-rev/scripts/update_src_rev.py \
+  meta-judo -n
+python3 .agents/skills/update-src-rev/scripts/update_src_rev.py \
+  meta-judo
+```
+
+**Multiple repos (dry run, then apply):**
+
+```bash
+cd /path/to/judo
+python3 .agents/skills/update-src-rev/scripts/update_src_rev.py \
+  mqtt-api judo-rest-api cfg-mgr -n
+python3 .agents/skills/update-src-rev/scripts/update_src_rev.py \
+  mqtt-api judo-rest-api cfg-mgr
 ```
 
 **From the source repo:**
@@ -269,7 +342,13 @@ Recipe project:
 When the user wants this operation:
 
 1. **Read** this skill.
-2. Confirm the **source repo** name. Ask if unclear.
+2. Confirm the repo name or names. Ask if unclear.
+   - Source repo: `mqtt-api`, `src/mqtt-api` → full three-step skill.
+   - Meta layer: `meta-judo`, `oe/meta-judo-proprietary` → manifest-only
+     pin (default; do not ask the user to pick a carrier source repo).
+   - Multiple repos: `/update-src-rev for each of mqtt-api meta-judo`
+     — pass every name to one script invocation (or one per repo with
+     the same flags). Each arg is classified independently.
 3. Run `update_src_rev.py` with `-n` first; show the script output
    (pre-flight + three steps + final result + push hints) without
    rewriting the layout.
@@ -297,7 +376,11 @@ retry blindly; inspect git state in both repos before re-running.
 
 | Situation | Action |
 |-----------|--------|
-| Missing repo argument | Pass repo name (e.g. `mqtt-api`). |
+| Missing repo argument | Pass one or more repo names (e.g. `mqtt-api`). |
+| `meta-judo` / `oe/meta-judo*` | Manifest-only pin; not an error. Do not ask for a carrier source. |
+| Multiple repos in one request | Pass all names to the script, or run once per repo. |
+| Multi-repo branch mismatch | Align every named repo to the same branch, or `--continue-preflight`. |
+| Failure on repo N of M | Earlier repos may already be applied; inspect git state before retry. |
 | `PREFLIGHT: action required` | AskQuestion; re-run with flags or after stash. |
 | Main is stale or diverged | Ask whether to fix, abort, or continue. |
 | Branch contains `_` | Ask whether to rename, abort, or continue. |

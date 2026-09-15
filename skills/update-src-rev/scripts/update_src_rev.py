@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
-Pin a source-repo commit into the Yocto recipe and default.xml.
+Pin a source-repo or meta-layer commit into default.xml (and SRCREV when
+applicable).
 
-Steps:
-1. Update SRCREV in the meta-judo recipe. Checkout or create a meta-layer
-   branch matching the source repo branch (new branches from origin/main
-   unless --base-existing), then commit the recipe.
+Source repo (src/<name>) — three steps:
+1. Update SRCREV in the meta-judo recipe and align the meta-layer branch.
 2. Pin the source repo SHA in default.xml.
 3. Pin the meta-layer (recipe repo) SHA in default.xml.
+
+Meta layer (oe/meta-judo*) — manifest-only:
+1. Align the workspace branch to the meta-layer branch.
+2. Pin the meta-layer HEAD SHA in default.xml (amend if revision-only).
 
 Never runs git push; only prints suggested commands. Stdlib only.
 """
@@ -21,6 +24,7 @@ import sys
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 from skill_git import (
     ISSUE_RE,
@@ -110,13 +114,22 @@ class PreflightResult:
 class SkillContext:
     workspace: Path
     manifest: Path
-    src_repo: Path
+    src_repo: Path | None
     meta_repo: Path
     manifest_repo: Path
     src_branch: str
     src_rel: str
     meta_rel: str
     manifest_repo_rel: str
+    meta_layer_only: bool = False
+
+
+@dataclass
+class RepoTarget:
+    mode: Literal["source", "meta_layer"]
+    src_repo: Path | None
+    meta_repo: Path | None
+    layers: list[Path]
 
 
 # --- pre-flight ---
@@ -284,12 +297,191 @@ def needs_branch_base_choice(
     return not base_existing
 
 
+def run_preflight_meta_layer(
+    ctx: SkillContext,
+    args: argparse.Namespace,
+    dry_run: bool,
+) -> PreflightResult:
+    """Pre-flight for oe/meta-judo*: align workspace; pin layer HEAD only."""
+    lines: list[RepoPreflightLine] = []
+    target = ctx.src_branch
+    warnings: list[str] = []
+
+    main_issues: list[str] = []
+    for label, repo in (
+        ("Meta layer", ctx.meta_repo),
+        ("Workspace", ctx.manifest_repo),
+    ):
+        issue = main_sync_issue(repo)
+        if issue:
+            main_issues.append(f"{label} ({repo}): {issue}")
+
+    if main_issues:
+        if args.fix_preflight and not dry_run:
+            for repo in (ctx.meta_repo, ctx.manifest_repo):
+                update_local_main(repo)
+        elif args.fix_preflight:
+            warnings.extend(main_issues)
+        elif args.continue_preflight:
+            warnings.extend(main_issues)
+        else:
+            preflight_exit(
+                [
+                    "The following main branches are not up to date:",
+                    *[f"  - {issue}" for issue in main_issues],
+                    (
+                        "Ask the user whether to fix them (fetch and "
+                        "fast-forward main), abort, or continue without "
+                        "changes."
+                    ),
+                ]
+            )
+
+    if "_" in target:
+        replacement = target.replace("_", "-")
+        message = (
+            f"Meta-layer branch {target} contains underscores; "
+            f"the required branch name is {replacement}."
+        )
+        if args.fix_preflight:
+            if not dry_run:
+                for repo in (ctx.meta_repo, ctx.manifest_repo):
+                    rename_current_branch(repo, target, replacement)
+            target = replacement
+            warnings.append(message + f" Renaming to {replacement}.")
+        elif args.continue_preflight:
+            warnings.append(message)
+        else:
+            preflight_exit(
+                [
+                    message,
+                    (
+                        "Ask the user whether to rename the local branches, "
+                        "abort, or continue without changes."
+                    ),
+                ]
+            )
+
+    ctx.src_branch = target
+    meta_planned_head = run_git(["rev-parse", "HEAD"], ctx.meta_repo)
+    meta_note = "defines target branch"
+
+    if repo_is_dirty(ctx.meta_repo):
+        if not args.allow_dirty_source:
+            preflight_exit(
+                [
+                    (
+                        f"Meta layer {ctx.meta_rel} has uncommitted changes. "
+                        "The pin uses committed HEAD only."
+                    ),
+                    (
+                        "Ask the user whether to continue. Re-run with "
+                        "--allow-dirty-source to continue, or commit/stash "
+                        "in the meta layer first."
+                    ),
+                ]
+            )
+        lines.append(
+            RepoPreflightLine(
+                label="Meta layer",
+                rel=ctx.meta_rel,
+                branch=target,
+                note="has uncommitted changes (--allow-dirty-source)",
+            )
+        )
+    else:
+        lines.append(
+            RepoPreflightLine(
+                label="Meta layer",
+                rel=ctx.meta_rel,
+                branch=target,
+                note="clean",
+            )
+        )
+
+    repo = ctx.manifest_repo
+    rel = ctx.manifest_repo_rel
+    label = "Workspace"
+    current = current_branch(repo)
+    if not current:
+        raise SystemExit(
+            f"ERROR: {label} ({rel}) is on detached HEAD; "
+            "check out a named branch first"
+        )
+
+    if current != target:
+        if repo_is_dirty(repo):
+            preflight_exit(
+                [
+                    (
+                        f"{label} ({rel}) is on {current} but the "
+                        f"meta-layer branch is {target}, and the repo "
+                        "has uncommitted changes."
+                    ),
+                    (
+                        "Commit or stash changes in that repo, then "
+                        "re-run the skill."
+                    ),
+                ]
+            )
+
+        if needs_branch_base_choice(repo, target, args.base_existing):
+            preflight_exit(
+                [
+                    (
+                        f"{label} ({rel}) is on {current} but the "
+                        f"meta-layer branch is {target}. Branch "
+                        f"{target} does not exist locally or on "
+                        "origin."
+                    ),
+                    (
+                        "Ask the user which base to use for the new "
+                        f"branch {target}:"
+                    ),
+                    (
+                        "  - main: re-run without --base-existing "
+                        "(default)"
+                    ),
+                    (
+                        f"  - current checkout ({current}): re-run "
+                        "with --base-existing"
+                    ),
+                ]
+            )
+
+    _, note = branch_alignment_plan(
+        repo, target, args.base_existing, dry_run
+    )
+    lines.append(
+        RepoPreflightLine(
+            label=label,
+            rel=rel,
+            branch=target,
+            note=note,
+        )
+    )
+
+    return PreflightResult(
+        source_branch=target,
+        lines=lines,
+        meta_planned_head=meta_planned_head,
+        meta_note=meta_note,
+        warnings=warnings,
+    )
+
+
 def run_preflight(
     ctx: SkillContext,
     args: argparse.Namespace,
     dry_run: bool,
 ) -> PreflightResult:
     """Validate branch alignment and source cleanliness before steps 1–3."""
+    if ctx.meta_layer_only:
+        return run_preflight_meta_layer(ctx, args, dry_run)
+
+    if ctx.src_repo is None:
+        raise SystemExit("ERROR: source repo is required for SRCREV updates")
+
     lines: list[RepoPreflightLine] = []
     original_target = ctx.src_branch
     target = original_target
@@ -468,19 +660,81 @@ def run_preflight(
     )
 
 
+def resolve_repo_target(
+    repo_arg: str, cwd: Path, workspace: Path
+) -> RepoTarget:
+    """Classify repo arg as a source repo or oe/meta-judo* layer."""
+    src_from_arg, meta_from_arg = parse_repo_arg(repo_arg, workspace)
+    src_from_cwd, meta_from_cwd = infer_from_cwd(cwd, workspace)
+
+    src_repo = src_from_arg or src_from_cwd
+    meta_hint = meta_from_arg or meta_from_cwd
+
+    if src_repo:
+        if not is_git_repo(src_repo):
+            raise SystemExit(f"ERROR: not a git repo: {src_repo}")
+        if meta_hint:
+            if not is_git_repo(meta_hint):
+                raise SystemExit(f"ERROR: not a git repo: {meta_hint}")
+            if not meta_hint.name.startswith("meta-judo"):
+                raise SystemExit(
+                    f"ERROR: oe repo must be a meta-judo* layer: {meta_hint}"
+                )
+            layers = [meta_hint]
+        else:
+            layers = meta_layer_roots(workspace)
+        return RepoTarget("source", src_repo, None, layers)
+
+    if meta_hint:
+        if not is_git_repo(meta_hint):
+            raise SystemExit(f"ERROR: not a git repo: {meta_hint}")
+        if not meta_hint.name.startswith("meta-judo"):
+            raise SystemExit(
+                f"ERROR: oe repo {meta_hint.name!r} is not a meta-judo* layer"
+            )
+        return RepoTarget("meta_layer", None, meta_hint, [meta_hint])
+
+    raise SystemExit(
+        f"ERROR: repo not found under src/ or oe/: {repo_arg!r} "
+        "(examples: mqtt-api, src/mqtt-api, meta-judo, "
+        "oe/meta-judo-proprietary)"
+    )
+
+
 def resolve_skill_context(
     args: argparse.Namespace, workspace: Path, manifest: Path
 ) -> SkillContext:
     """Resolve repos and branches used by pre-flight and the three steps."""
     cwd = Path.cwd()
-    src_repo, layers = resolve_repos(args.repo, cwd, workspace)
-    recipe = resolve_recipe(
-        layers, src_repo.name, args.recipe, workspace
-    )
-    meta_repo = meta_repo_for_recipe(recipe)
+    target = resolve_repo_target(args.repo, cwd, workspace)
     manifest_repo = Path(
         run_git(["rev-parse", "--show-toplevel"], manifest.parent)
     )
+    manifest_repo_rel = recipe_display_path(manifest_repo, workspace)
+
+    if target.mode == "meta_layer":
+        assert target.meta_repo is not None
+        meta_repo = target.meta_repo
+        src_branch = source_branch_name(meta_repo)
+        return SkillContext(
+            workspace=workspace,
+            manifest=manifest,
+            src_repo=None,
+            meta_repo=meta_repo,
+            manifest_repo=manifest_repo,
+            src_branch=src_branch,
+            src_rel="",
+            meta_rel=recipe_display_path(meta_repo, workspace),
+            manifest_repo_rel=manifest_repo_rel,
+            meta_layer_only=True,
+        )
+
+    assert target.src_repo is not None
+    src_repo = target.src_repo
+    recipe = resolve_recipe(
+        target.layers, src_repo.name, args.recipe, workspace
+    )
+    meta_repo = meta_repo_for_recipe(recipe)
     src_branch = source_branch_name(src_repo)
     return SkillContext(
         workspace=workspace,
@@ -491,7 +745,8 @@ def resolve_skill_context(
         src_branch=src_branch,
         src_rel=recipe_display_path(src_repo, workspace),
         meta_rel=recipe_display_path(meta_repo, workspace),
-        manifest_repo_rel=recipe_display_path(manifest_repo, workspace),
+        manifest_repo_rel=manifest_repo_rel,
+        meta_layer_only=False,
     )
 
 
@@ -574,32 +829,14 @@ def meta_layer_roots(workspace: Path) -> list[Path]:
 def resolve_repos(
     repo_arg: str, cwd: Path, workspace: Path
 ) -> tuple[Path, list[Path]]:
-    src_from_arg, meta_from_arg = parse_repo_arg(repo_arg, workspace)
-    src_from_cwd, meta_from_cwd = infer_from_cwd(cwd, workspace)
-
-    src_repo = src_from_arg or src_from_cwd
-    meta_layer = meta_from_arg or meta_from_cwd
-
-    if not src_repo:
+    """Resolve a source repo and meta-judo layers for recipe updates."""
+    target = resolve_repo_target(repo_arg, cwd, workspace)
+    if target.mode != "source" or target.src_repo is None:
         raise SystemExit(
             "ERROR: source repo not resolved; pass a source repo name "
             "(e.g. mqtt-api, src/mqtt-api) or cd to src/<repo>"
         )
-    if not is_git_repo(src_repo):
-        raise SystemExit(f"ERROR: not a git repo: {src_repo}")
-
-    if meta_layer:
-        if not is_git_repo(meta_layer):
-            raise SystemExit(f"ERROR: not a git repo: {meta_layer}")
-        if not meta_layer.name.startswith("meta-judo"):
-            raise SystemExit(
-                f"ERROR: oe repo must be a meta-judo* layer: {meta_layer}"
-            )
-        layers = [meta_layer]
-    else:
-        layers = meta_layer_roots(workspace)
-
-    return src_repo, layers
+    return target.src_repo, target.layers
 
 
 def recipe_references_repo(content: str, repo_name: str) -> bool:
@@ -1210,6 +1447,68 @@ def print_step(title: str, bullets: list[str]) -> None:
     print()
 
 
+def print_meta_layer_report(
+    ctx: SkillContext,
+    recipe_pin: ManifestPinResult,
+    dry_run: bool,
+    applied: list[str] | None = None,
+    incomplete: bool = False,
+) -> None:
+    print_step(
+        "Step 1 — Recipe SRCREV",
+        [
+            "Skipped — meta-layer-only pin (no source repo / SRCREV)",
+        ],
+    )
+    print_step(
+        "Step 2 — Manifest source project",
+        [
+            "Skipped — meta-layer-only pin",
+        ],
+    )
+    recipe_outcome = recipe_pin.outcome
+    if not recipe_pin.changed:
+        recipe_outcome = (
+            "default.xml revision already matches meta-layer HEAD — no change"
+        )
+    print_step(
+        "Step 3 — Manifest meta-layer project",
+        [
+            (
+                f"Project: {recipe_pin.project_name} → "
+                f"{recipe_pin.project_path} at {recipe_pin.new_revision}"
+            ),
+            f"Outcome: {recipe_outcome}",
+        ],
+    )
+    print()
+    print("Final result")
+    print()
+    if incomplete:
+        print("  RESULT: apply incomplete")
+        print()
+        return
+    if dry_run:
+        print("  RESULT: dry-run complete for meta-layer manifest pin")
+        print()
+        if not recipe_pin.changed:
+            print(
+                "  Everything is already in sync, so an apply run would "
+                "make no commits or file changes."
+            )
+            print()
+        else:
+            print(
+                "  An apply run would use one default.xml commit "
+                "(amend if HEAD only changed revision attrs)."
+            )
+            print()
+        return
+    targets = " and ".join(applied or [])
+    print(f"  RESULT: apply complete ({targets})")
+    print()
+
+
 def print_report(
     recipe: RecipeResult,
     source_pin: ManifestPinResult,
@@ -1312,6 +1611,43 @@ def issue_for_manifest(
     )
 
 
+def issue_for_meta_layer(
+    args: argparse.Namespace, ctx: SkillContext
+) -> str:
+    if args.issue:
+        return args.issue
+    found = ISSUE_RE.search(ctx.src_branch)
+    if found:
+        return found.group(0)
+    extracted = extract_issue(ctx.meta_repo)
+    if extracted:
+        return extracted
+    raise SystemExit(
+        "ERROR: could not parse issue id from branch name; pass --issue"
+    )
+
+
+def manifest_commit_message_meta_layer(
+    issue: str,
+    branch: str,
+    recipe_pin: ManifestPinResult,
+) -> str:
+    """Workspace commit for oe/meta-judo* manifest-only pins."""
+    subject = f"{issue}:{branch} Update SRCREV"
+    body = "\n".join(
+        [
+            "Recipe project:",
+            f"  name: {recipe_pin.project_name}",
+            f"  path: {recipe_pin.project_path}",
+            (
+                f"  revision: {recipe_pin.old_revision} -> "
+                f"{recipe_pin.new_revision}"
+            ),
+        ]
+    )
+    return f"{subject}\n\n{body}"
+
+
 def manifest_commit_message(
     issue: str,
     branch: str,
@@ -1321,8 +1657,8 @@ def manifest_commit_message(
     """Workspace commit: subject uses branch; body lists both projects."""
     subject = f"{issue}:{branch} Update SRCREV"
     lines: list[str] = []
-    if pins:
-        source = pins[0]
+    source = pins[0] if pins else None
+    if source and source.project_path.startswith("src/"):
         lines.extend(
             [
                 "Source project:",
@@ -1331,7 +1667,7 @@ def manifest_commit_message(
                 f"  revision: {source.old_revision} -> {source.new_revision}",
             ]
         )
-    recipe_pin = pins[1] if len(pins) > 1 else None
+    recipe_pin = pins[1] if len(pins) > 1 else (pins[0] if pins else None)
     if recipe_pin or recipe.recipe_path or recipe.var_name:
         if lines:
             lines.append("")
@@ -1355,6 +1691,33 @@ def manifest_commit_message(
     if body:
         return f"{subject}\n\n{body}"
     return subject
+
+
+def commit_meta_layer_manifest(
+    args: argparse.Namespace,
+    workspace: Path,
+    ctx: SkillContext,
+    recipe_pin: ManifestPinResult,
+) -> None:
+    manifest = (
+        Path(args.manifest).resolve()
+        if args.manifest
+        else (workspace / "default.xml").resolve()
+    )
+    repo = Path(run_git(["rev-parse", "--show-toplevel"], manifest.parent))
+    try:
+        rel = str(manifest.relative_to(repo))
+    except ValueError:
+        rel = str(manifest)
+    if not path_is_dirty(repo, rel):
+        return
+    issue = issue_for_meta_layer(args, ctx)
+    message = manifest_commit_message_meta_layer(
+        issue, ctx.src_branch, recipe_pin
+    )
+    commit_or_amend(
+        repo, rel, message, is_revision_only_diff, quiet=True
+    )
 
 
 def commit_manifest_bundle(
@@ -1384,19 +1747,113 @@ def commit_manifest_bundle(
     )
 
 
+def repo_branch_info(
+    repo_arg: str, cwd: Path, workspace: Path
+) -> tuple[str, str]:
+    """Return (display path, current branch) for a repo argument."""
+    target = resolve_repo_target(repo_arg, cwd, workspace)
+    if target.mode == "meta_layer":
+        assert target.meta_repo is not None
+        repo = target.meta_repo
+    else:
+        assert target.src_repo is not None
+        repo = target.src_repo
+    branch = current_branch(repo)
+    rel = recipe_display_path(repo, workspace)
+    if not branch:
+        raise SystemExit(
+            f"ERROR: {rel} is on detached HEAD; "
+            "check out a named branch first"
+        )
+    return rel, branch
+
+
+def run_multi_repo_branch_preflight(
+    repos: list[str],
+    cwd: Path,
+    workspace: Path,
+    args: argparse.Namespace,
+) -> None:
+    """Require every repo arg to be on the same branch name."""
+    entries: list[tuple[str, str, str]] = []
+    for repo_arg in repos:
+        rel, branch = repo_branch_info(repo_arg, cwd, workspace)
+        entries.append((repo_arg, rel, branch))
+
+    branches = {branch for _, _, branch in entries}
+    if len(branches) == 1:
+        branch = branches.pop()
+        print("Pre-flight — multi-repo branch alignment")
+        print()
+        for repo_arg, rel, branch_name in entries:
+            print(f"  • {repo_arg} ({rel}): {branch_name}")
+        print()
+        print(f"  All {len(repos)} repos on branch {branch}.")
+        print()
+        return
+
+    if args.continue_preflight:
+        listing = ", ".join(sorted(branches))
+        print("Pre-flight — multi-repo branch alignment")
+        print()
+        for repo_arg, rel, branch_name in entries:
+            print(f"  • {repo_arg} ({rel}): {branch_name}")
+        print()
+        print(
+            f"  Warning: repos are on different branches ({listing}); "
+            "continuing due to --continue-preflight."
+        )
+        print()
+        return
+
+    preflight_exit(
+        [
+            "The following repos are not on the same branch:",
+            *[
+                f"  - {repo_arg} ({rel}): {branch}"
+                for repo_arg, rel, branch in entries
+            ],
+            (
+                "Check out the same branch in each repo, then re-run. "
+                "Or pass --continue-preflight to proceed anyway."
+            ),
+        ]
+    )
+
+
+def parse_repo_list(raw_repos: list[str]) -> list[str]:
+    """Normalize repo CLI args; strip optional 'for each of' prefix."""
+    repos: list[str] = []
+    for raw in raw_repos:
+        text = raw.strip()
+        if not text:
+            continue
+        lowered = text.lower()
+        if lowered.startswith("for each of "):
+            text = text[len("for each of ") :]
+        repos.extend(part for part in text.split() if part)
+    if not repos:
+        raise SystemExit("ERROR: repo name is required")
+    return repos
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="update_src_rev",
         description=(
-            "Update recipe SRCREV, match the meta-layer branch to the "
-            "source branch, and pin source plus recipe SHAs in default.xml."
+            "Update recipe SRCREV and default.xml pins for src/<repo>, or "
+            "pin oe/meta-judo* HEAD in default.xml only. Pass one or more "
+            "repo names to run the skill on each."
         ),
     )
     parser.add_argument(
-        "repo",
+        "repos",
+        nargs="+",
+        metavar="repo",
         help=(
-            "Source repo name or path (required). Examples: mqtt-api, "
-            "src/mqtt-api"
+            "One or more repo names or paths. src/<name> runs SRCREV plus "
+            "manifest pins; oe/meta-judo* pins the layer HEAD in "
+            "default.xml only. Multiple repos run once per repo."
         ),
     )
     parser.add_argument(
@@ -1465,24 +1922,117 @@ def parse_args() -> argparse.Namespace:
         parser.error(
             "--fix-preflight and --continue-preflight are mutually exclusive"
         )
+    args.repos = parse_repo_list(args.repos)
     return args
 
 
-def main() -> int:
-    args = parse_args()
-    cwd = Path.cwd()
-    workspace = (
-        Path(args.workspace).resolve()
-        if args.workspace
-        else find_workspace_root(cwd)
+def print_repo_banner(repo_name: str, index: int, total: int) -> None:
+    if total <= 1:
+        return
+    print(f"Repository {index} of {total}: {repo_name}")
+    print()
+
+
+def process_meta_layer_repo(
+    ctx: SkillContext,
+    args: argparse.Namespace,
+    workspace: Path,
+    manifest: Path,
+) -> int:
+    """Pin oe/meta-judo* HEAD in default.xml only."""
+    preflight = run_preflight(ctx, args, dry_run=True)
+    meta_head = preflight.meta_planned_head or run_git(
+        ["rev-parse", "HEAD"], ctx.meta_repo
     )
-    manifest = (
-        Path(args.manifest).resolve()
-        if args.manifest
-        else (workspace / "default.xml").resolve()
+    recipe_pin = update_manifest_pin(
+        workspace,
+        manifest,
+        ctx.meta_rel,
+        meta_head,
+        dry_run=True,
+    )
+    push_hints = collect_push_hints(
+        [
+            PushHint(
+                rel=ctx.meta_rel,
+                repo=ctx.meta_repo,
+                branch=ctx.src_branch,
+            )
+        ],
+        recipe_pin.push_hints,
     )
 
+    if args.dry_run:
+        print_preflight(preflight)
+        print_meta_layer_report(ctx, recipe_pin, dry_run=True)
+        print_pushes(push_hints)
+        return 0
+
+    run_preflight(ctx, args, dry_run=False)
+    preflight = run_preflight(ctx, args, dry_run=True)
+    meta_head = run_git(["rev-parse", "HEAD"], ctx.meta_repo)
+
+    applied: list[str] = []
+    try:
+        recipe_pin = update_manifest_pin(
+            workspace,
+            manifest,
+            ctx.meta_rel,
+            meta_head,
+            dry_run=False,
+        )
+        applied.append("manifest meta-layer project")
+    except SystemExit as exc:
+        code = exc.code if isinstance(exc.code, int) else 1
+        if isinstance(exc.code, str) and exc.code:
+            eprint(exc.code)
+            code = 1
+        eprint("ERROR: apply failed")
+        print_meta_layer_report(
+            ctx,
+            recipe_pin,
+            dry_run=False,
+            applied=applied,
+            incomplete=True,
+        )
+        print_pushes(push_hints)
+        return code if code else 1
+
+    push_hints = collect_push_hints(
+        [
+            PushHint(
+                rel=ctx.meta_rel,
+                repo=ctx.meta_repo,
+                branch=ctx.src_branch,
+            )
+        ],
+        recipe_pin.push_hints,
+    )
+
+    if not args.no_commit:
+        commit_meta_layer_manifest(args, workspace, ctx, recipe_pin)
+        applied.append("manifest commit")
+
+    print_preflight(preflight)
+    print_meta_layer_report(
+        ctx, recipe_pin, dry_run=False, applied=applied
+    )
+    print_pushes(push_hints)
+    return 0
+
+
+def process_repo(
+    repo_name: str,
+    args: argparse.Namespace,
+    workspace: Path,
+    manifest: Path,
+) -> int:
+    """Run the full skill (dry-run gate, then apply) for one repo arg."""
+    args.repo = repo_name
     ctx = resolve_skill_context(args, workspace, manifest)
+    if ctx.meta_layer_only:
+        return process_meta_layer_repo(ctx, args, workspace, manifest)
+
     preflight = run_preflight(ctx, args, dry_run=True)
 
     recipe = update_recipe(
@@ -1491,7 +2041,7 @@ def main() -> int:
     source_pin = update_manifest_pin(
         workspace,
         manifest,
-        args.repo,
+        repo_name,
         args.srcrev,
         dry_run=True,
     )
@@ -1523,7 +2073,7 @@ def main() -> int:
         source_pin = update_manifest_pin(
             workspace,
             manifest,
-            args.repo,
+            repo_name,
             args.srcrev,
             dry_run=False,
         )
@@ -1573,6 +2123,62 @@ def main() -> int:
     )
     print_pushes(push_hints)
     return 0
+
+
+def main() -> int:
+    args = parse_args()
+    cwd = Path.cwd()
+    workspace = (
+        Path(args.workspace).resolve()
+        if args.workspace
+        else find_workspace_root(cwd)
+    )
+    manifest = (
+        Path(args.manifest).resolve()
+        if args.manifest
+        else (workspace / "default.xml").resolve()
+    )
+
+    repos = args.repos
+    if len(repos) > 1:
+        run_multi_repo_branch_preflight(repos, cwd, workspace, args)
+
+    exit_code = 0
+    for index, repo_name in enumerate(repos, start=1):
+        if index > 1:
+            print()
+        print_repo_banner(repo_name, index, len(repos))
+        try:
+            code = process_repo(repo_name, args, workspace, manifest)
+        except SystemExit as exc:
+            code = exc.code if isinstance(exc.code, int) else 1
+            if isinstance(exc.code, str) and exc.code:
+                eprint(exc.code)
+                code = 1
+        if code:
+            exit_code = code
+            if len(repos) > 1:
+                eprint(
+                    f"ERROR: stopped after failure on {repo_name} "
+                    f"({index} of {len(repos)})"
+                )
+            break
+
+    if len(repos) > 1 and exit_code == 0:
+        print()
+        print("Final result")
+        print()
+        print(
+            f"  RESULT: apply complete for all {len(repos)} repositories"
+            if not args.dry_run
+            else (
+                f"  RESULT: dry-run complete for all {len(repos)} "
+                "repositories"
+            )
+        )
+        print()
+
+    return exit_code
 
 
 if __name__ == "__main__":
