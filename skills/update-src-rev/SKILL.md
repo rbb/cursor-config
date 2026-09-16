@@ -26,17 +26,23 @@ The script classifies each repo argument automatically:
 **Do not** treat `oe/meta-judo*` as an error or ask how to proceed.
 Pass `meta-judo` (or `oe/meta-judo`) directly.
 
-### Source repo (`src/<name>`) — three steps
+### Source repo (`src/<name>`) — four steps
 
 | Step | Git repo | Artifact |
 |------|----------|----------|
 | 1 | `oe/meta-judo*` | Matching branch + `SRCREV` commit |
 | 2 | Manifest (workspace root) | Source `<project revision>` |
 | 3 | Manifest (workspace root) | Recipe-layer `<project revision>` |
+| 4 | Manifest (workspace root) | `manifest-judo` self `<project revision>` |
 
 Step 1 reads the source SHA from the source repo `HEAD` (or `--srcrev`).
 Step 3 uses the meta-layer `HEAD` **after** the recipe commit (or after
 checking out the matching branch if SRCREV already matched).
+
+Step 4 pins the `manifest-judo` project (path `.`) to the workspace
+branch name so `repo manifest -r` locks manifest scripts (e.g.
+`scripts/build-fntest-container.sh`) from the feature branch, not
+`main`. On `main`, revision stays `main`.
 
 ### Meta layer (`oe/meta-judo*`) — manifest-only
 
@@ -45,6 +51,7 @@ checking out the matching branch if SRCREV already matched).
 | Pre-flight | Meta layer + workspace | Align workspace to meta-layer branch |
 | 1–2 | — | Skipped (no source repo / SRCREV) |
 | 3 | Manifest (workspace root) | Meta-layer `<project revision>` → layer `HEAD` |
+| 4 | Manifest (workspace root) | `manifest-judo` self revision → branch name |
 
 Uses the meta-layer's **current branch** and **committed HEAD**. No
 carrier source repo is required. Amends the manifest commit when HEAD
@@ -271,6 +278,11 @@ Step 3 — Manifest recipe project
 
   • Project: meta-judo-proprietary → oe/meta-judo-proprietary at dd17e9581e34a608830123ded24e366763e724cb
   • Outcome: default.xml revision already matches meta-layer HEAD — no change
+
+Step 4 — Manifest self project (manifest-judo)
+
+  • Project: manifest-judo → . revision feature/SUMO-588_func_test_flicker
+  • Outcome: default.xml manifest-judo revision already matches workspace branch — no change
 
 
 Final result

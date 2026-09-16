@@ -55,6 +55,8 @@ NAME_PARAM_RE = re.compile(r"(?:^|;)\s*name=([A-Za-z0-9_.-]+)")
 ATTR_NAME = re.compile(r'\bname="([^"]*)"')
 ATTR_PATH = re.compile(r'\bpath="([^"]*)"')
 REVISION_ATTR_START = re.compile(r'\brevision="')
+MANIFEST_JUDO_NAME = "manifest-judo"
+MANIFEST_JUDO_PATH = "."
 
 
 @dataclass
@@ -1291,6 +1293,104 @@ def resolve_source_repo(
     )
 
 
+def manifest_self_revision_target(branch: str) -> str:
+    """Return the default.xml revision for manifest-judo on this branch."""
+    return "main" if branch == "main" else branch
+
+
+def sync_manifest_self_pin(
+    workspace: Path,
+    manifest: Path,
+    branch: str,
+    dry_run: bool,
+) -> ManifestPinResult:
+    """Pin manifest-judo to the workspace branch (not main's HEAD)."""
+    if not manifest.is_file():
+        raise SystemExit(f"ERROR: manifest not found: {manifest}")
+
+    manifest_text = manifest.read_text(encoding="utf-8")
+    matches = find_project_matches(
+        manifest_text, MANIFEST_JUDO_NAME, MANIFEST_JUDO_PATH
+    )
+    if not matches:
+        raise SystemExit(
+            f"ERROR: no <project> found in {manifest} for "
+            f"name={MANIFEST_JUDO_NAME!r} path={MANIFEST_JUDO_PATH!r}"
+        )
+    if len(matches) > 1:
+        raise SystemExit(
+            "ERROR: multiple manifest-judo projects found in "
+            f"{manifest}"
+        )
+
+    line_index, project_name, project_path, old_revision = matches[0]
+    new_revision = manifest_self_revision_target(branch)
+    manifest_rel = workspace_rel(manifest, workspace)
+
+    manifest_repo = Path(
+        run_git(["rev-parse", "--show-toplevel"], manifest.parent)
+    )
+    manifest_repo_rel = workspace_rel(manifest_repo, workspace)
+    manifest_branch = run_git(["branch", "--show-current"], manifest_repo)
+    pushes: list[PushHint] = []
+    if manifest_branch:
+        pushes.append(
+            PushHint(
+                rel=manifest_repo_rel,
+                repo=manifest_repo,
+                branch=manifest_branch,
+            )
+        )
+
+    already = old_revision == new_revision
+    if already:
+        outcome = (
+            f"{manifest_rel} manifest-judo revision already "
+            f"matches branch {branch} — no change"
+        )
+    elif dry_run:
+        outcome = (
+            f"would update {manifest_rel} manifest-judo revision "
+            f"{old_revision} -> {new_revision}"
+        )
+    else:
+        outcome = (
+            f"updated {manifest_rel} manifest-judo revision "
+            f"{old_revision} -> {new_revision}"
+        )
+
+    result = ManifestPinResult(
+        project_name=project_name,
+        project_path=project_path,
+        old_revision=old_revision,
+        new_revision=new_revision,
+        changed=not already,
+        outcome=outcome,
+        push_hints=pushes,
+        manifest_rel=str(manifest_rel),
+    )
+
+    if already:
+        return result
+
+    lines = manifest_text.splitlines(keepends=True)
+    updated_line = merge_revision_into_line(
+        lines[line_index].rstrip("\r\n"),
+        new_revision,
+    )
+    if not updated_line.endswith("\n"):
+        updated_line += "\n"
+    lines[line_index] = updated_line
+    updated_text = "".join(lines)
+
+    if dry_run:
+        return result
+
+    manifest.write_text(updated_text, encoding="utf-8")
+    validate_manifest(manifest)
+    return result
+
+
 def update_manifest_pin(
     workspace: Path,
     manifest: Path,
@@ -1447,9 +1547,30 @@ def print_step(title: str, bullets: list[str]) -> None:
     print()
 
 
+def print_manifest_self_step(self_pin: ManifestPinResult) -> None:
+    outcome = self_pin.outcome
+    if not self_pin.changed:
+        outcome = (
+            "default.xml manifest-judo revision already matches "
+            "workspace branch — no change"
+        )
+    print_step(
+        "Step 4 — Manifest self project (manifest-judo)",
+        [
+            (
+                f"Project: {self_pin.project_name} → "
+                f"{self_pin.project_path} revision "
+                f"{self_pin.new_revision}"
+            ),
+            f"Outcome: {outcome}",
+        ],
+    )
+
+
 def print_meta_layer_report(
     ctx: SkillContext,
     recipe_pin: ManifestPinResult,
+    self_pin: ManifestPinResult,
     dry_run: bool,
     applied: list[str] | None = None,
     incomplete: bool = False,
@@ -1481,6 +1602,7 @@ def print_meta_layer_report(
             f"Outcome: {recipe_outcome}",
         ],
     )
+    print_manifest_self_step(self_pin)
     print()
     print("Final result")
     print()
@@ -1491,7 +1613,7 @@ def print_meta_layer_report(
     if dry_run:
         print("  RESULT: dry-run complete for meta-layer manifest pin")
         print()
-        if not recipe_pin.changed:
+        if not recipe_pin.changed and not self_pin.changed:
             print(
                 "  Everything is already in sync, so an apply run would "
                 "make no commits or file changes."
@@ -1513,6 +1635,7 @@ def print_report(
     recipe: RecipeResult,
     source_pin: ManifestPinResult,
     recipe_pin: ManifestPinResult,
+    self_pin: ManifestPinResult,
     dry_run: bool,
     applied: list[str] | None = None,
     incomplete: bool = False,
@@ -1556,6 +1679,7 @@ def print_report(
             f"Outcome: {recipe_outcome}",
         ],
     )
+    print_manifest_self_step(self_pin)
     print()
     print("Final result")
     print()
@@ -1566,13 +1690,22 @@ def print_report(
     if dry_run:
         print("  RESULT: dry-run complete for all requested steps")
         print()
-        if not recipe.changed and not source_pin.changed and not recipe_pin.changed:
+        if (
+            not recipe.changed
+            and not source_pin.changed
+            and not recipe_pin.changed
+            and not self_pin.changed
+        ):
             print(
                 "  Everything is already in sync, so an apply run would "
                 "make no commits or file changes."
             )
             print()
-        elif source_pin.changed or recipe_pin.changed:
+        elif (
+            source_pin.changed
+            or recipe_pin.changed
+            or self_pin.changed
+        ):
             print(
                 "  An apply run would use one default.xml commit "
                 "(amend if HEAD only changed revision attrs)."
@@ -1627,24 +1760,41 @@ def issue_for_meta_layer(
     )
 
 
+def manifest_self_body_lines(self_pin: ManifestPinResult) -> list[str]:
+    if not self_pin.changed:
+        return []
+    return [
+        "Manifest self project:",
+        f"  name: {self_pin.project_name}",
+        f"  path: {self_pin.project_path}",
+        (
+            f"  revision: {self_pin.old_revision} -> "
+            f"{self_pin.new_revision}"
+        ),
+    ]
+
+
 def manifest_commit_message_meta_layer(
     issue: str,
     branch: str,
     recipe_pin: ManifestPinResult,
+    self_pin: ManifestPinResult,
 ) -> str:
     """Workspace commit for oe/meta-judo* manifest-only pins."""
     subject = f"{issue}:{branch} Update SRCREV"
-    body = "\n".join(
-        [
-            "Recipe project:",
-            f"  name: {recipe_pin.project_name}",
-            f"  path: {recipe_pin.project_path}",
-            (
-                f"  revision: {recipe_pin.old_revision} -> "
-                f"{recipe_pin.new_revision}"
-            ),
-        ]
-    )
+    lines = [
+        "Recipe project:",
+        f"  name: {recipe_pin.project_name}",
+        f"  path: {recipe_pin.project_path}",
+        (
+            f"  revision: {recipe_pin.old_revision} -> "
+            f"{recipe_pin.new_revision}"
+        ),
+    ]
+    self_lines = manifest_self_body_lines(self_pin)
+    if self_lines:
+        lines.extend([""] + self_lines)
+    body = "\n".join(lines)
     return f"{subject}\n\n{body}"
 
 
@@ -1653,6 +1803,7 @@ def manifest_commit_message(
     branch: str,
     recipe: RecipeResult,
     pins: list[ManifestPinResult],
+    self_pin: ManifestPinResult,
 ) -> str:
     """Workspace commit: subject uses branch; body lists both projects."""
     subject = f"{issue}:{branch} Update SRCREV"
@@ -1687,6 +1838,11 @@ def manifest_commit_message(
             lines.append(
                 f"  {recipe.var_name}: {recipe.old_rev} -> {recipe.srcrev}"
             )
+    self_lines = manifest_self_body_lines(self_pin)
+    if self_lines:
+        if lines:
+            lines.append("")
+        lines.extend(self_lines)
     body = "\n".join(lines).rstrip()
     if body:
         return f"{subject}\n\n{body}"
@@ -1698,6 +1854,7 @@ def commit_meta_layer_manifest(
     workspace: Path,
     ctx: SkillContext,
     recipe_pin: ManifestPinResult,
+    self_pin: ManifestPinResult,
 ) -> None:
     manifest = (
         Path(args.manifest).resolve()
@@ -1713,7 +1870,7 @@ def commit_meta_layer_manifest(
         return
     issue = issue_for_meta_layer(args, ctx)
     message = manifest_commit_message_meta_layer(
-        issue, ctx.src_branch, recipe_pin
+        issue, ctx.src_branch, recipe_pin, self_pin
     )
     commit_or_amend(
         repo, rel, message, is_revision_only_diff, quiet=True
@@ -1725,6 +1882,7 @@ def commit_manifest_bundle(
     workspace: Path,
     recipe: RecipeResult,
     pins: list[ManifestPinResult],
+    self_pin: ManifestPinResult,
 ) -> None:
     manifest = (
         Path(args.manifest).resolve()
@@ -1740,7 +1898,7 @@ def commit_manifest_bundle(
         return
     issue = issue_for_manifest(args, recipe)
     message = manifest_commit_message(
-        issue, recipe.src_branch, recipe, pins
+        issue, recipe.src_branch, recipe, pins, self_pin
     )
     commit_or_amend(
         repo, rel, message, is_revision_only_diff, quiet=True
@@ -1951,6 +2109,9 @@ def process_meta_layer_repo(
         meta_head,
         dry_run=True,
     )
+    self_pin = sync_manifest_self_pin(
+        workspace, manifest, ctx.src_branch, dry_run=True
+    )
     push_hints = collect_push_hints(
         [
             PushHint(
@@ -1960,11 +2121,14 @@ def process_meta_layer_repo(
             )
         ],
         recipe_pin.push_hints,
+        self_pin.push_hints,
     )
 
     if args.dry_run:
         print_preflight(preflight)
-        print_meta_layer_report(ctx, recipe_pin, dry_run=True)
+        print_meta_layer_report(
+            ctx, recipe_pin, self_pin, dry_run=True
+        )
         print_pushes(push_hints)
         return 0
 
@@ -1982,6 +2146,10 @@ def process_meta_layer_repo(
             dry_run=False,
         )
         applied.append("manifest meta-layer project")
+        self_pin = sync_manifest_self_pin(
+            workspace, manifest, ctx.src_branch, dry_run=False
+        )
+        applied.append("manifest self project")
     except SystemExit as exc:
         code = exc.code if isinstance(exc.code, int) else 1
         if isinstance(exc.code, str) and exc.code:
@@ -1991,6 +2159,7 @@ def process_meta_layer_repo(
         print_meta_layer_report(
             ctx,
             recipe_pin,
+            self_pin,
             dry_run=False,
             applied=applied,
             incomplete=True,
@@ -2007,15 +2176,18 @@ def process_meta_layer_repo(
             )
         ],
         recipe_pin.push_hints,
+        self_pin.push_hints,
     )
 
     if not args.no_commit:
-        commit_meta_layer_manifest(args, workspace, ctx, recipe_pin)
+        commit_meta_layer_manifest(
+            args, workspace, ctx, recipe_pin, self_pin
+        )
         applied.append("manifest commit")
 
     print_preflight(preflight)
     print_meta_layer_report(
-        ctx, recipe_pin, dry_run=False, applied=applied
+        ctx, recipe_pin, self_pin, dry_run=False, applied=applied
     )
     print_pushes(push_hints)
     return 0
@@ -2052,14 +2224,22 @@ def process_repo(
         recipe.meta_head,
         dry_run=True,
     )
+    self_pin = sync_manifest_self_pin(
+        workspace, manifest, recipe.src_branch, dry_run=True
+    )
     pins = [source_pin, recipe_pin]
     push_hints = collect_push_hints(
-        recipe.push_hints, source_pin.push_hints, recipe_pin.push_hints
+        recipe.push_hints,
+        source_pin.push_hints,
+        recipe_pin.push_hints,
+        self_pin.push_hints,
     )
 
     if args.dry_run:
         print_preflight(preflight)
-        print_report(recipe, source_pin, recipe_pin, dry_run=True)
+        print_report(
+            recipe, source_pin, recipe_pin, self_pin, dry_run=True
+        )
         print_pushes(push_hints)
         return 0
 
@@ -2086,6 +2266,10 @@ def process_repo(
             dry_run=False,
         )
         applied.append("manifest recipe project")
+        self_pin = sync_manifest_self_pin(
+            workspace, manifest, recipe.src_branch, dry_run=False
+        )
+        applied.append("manifest self project")
     except SystemExit as exc:
         code = exc.code if isinstance(exc.code, int) else 1
         if isinstance(exc.code, str) and exc.code:
@@ -2101,6 +2285,7 @@ def process_repo(
             recipe,
             source_pin,
             recipe_pin,
+            self_pin,
             dry_run=False,
             applied=applied,
             incomplete=True,
@@ -2110,16 +2295,24 @@ def process_repo(
 
     pins = [source_pin, recipe_pin]
     push_hints = collect_push_hints(
-        recipe.push_hints, source_pin.push_hints, recipe_pin.push_hints
+        recipe.push_hints,
+        source_pin.push_hints,
+        recipe_pin.push_hints,
+        self_pin.push_hints,
     )
 
     if not args.no_commit:
-        commit_manifest_bundle(args, workspace, recipe, pins)
+        commit_manifest_bundle(args, workspace, recipe, pins, self_pin)
         applied.append("manifest commit")
 
     print_preflight(preflight)
     print_report(
-        recipe, source_pin, recipe_pin, dry_run=False, applied=applied
+        recipe,
+        source_pin,
+        recipe_pin,
+        self_pin,
+        dry_run=False,
+        applied=applied,
     )
     print_pushes(push_hints)
     return 0
