@@ -99,8 +99,13 @@ The default is to stop with `PREFLIGHT: action required`; never choose
 After these checks, the script aligns the **meta-layer** and
 **workspace** (manifest) repos to the **source repo branch name**:
 
-1. If the repo already has that branch locally, check it out.
-2. Else if `origin/<branch>` exists, check it out as a local branch.
+1. If the repo already has that branch locally, check it out — but only
+   when its history is compatible with the current checkout (one is an
+   ancestor of the other). If histories diverge, stop with
+   `PREFLIGHT: action required` unless `--recreate-branch` or
+   `--continue-preflight` is passed.
+2. Else if `origin/<branch>` exists, check it out as a local branch
+   (same ancestry check as step 1).
 3. Else create a new branch from **`origin/main`** (or local `main`).
    When the repo is not on `main`, the script stops with
    `PREFLIGHT: action required` so the agent can ask whether the new
@@ -113,6 +118,21 @@ pass `--base-existing` (applies to both meta-layer and workspace):
 python3 .agents/skills/update-src-rev/scripts/update_src_rev.py \
   mqtt-api --base-existing
 ```
+
+When an **existing** target branch has the right name but the wrong
+parent (for example workspace on `feature/SUMO-588-func-test-flicker`
+and a stale local `feature/CSNMR-6399-fntest-loop` based on `main`),
+pass `--recreate-branch` to run `git checkout -B <target>` from the
+current checkout instead of checking out the stale branch:
+
+```bash
+python3 .agents/skills/update-src-rev/scripts/update_src_rev.py \
+  mqtt-api --recreate-branch
+```
+
+After `rebase-redo`, when the manifest is still on `branch_b` and
+sources are on `branch_a`, prefer `--recreate-branch` (or align branches
+manually) before multi-repo `update-src-rev`.
 
 Example: workspace on `feature/old`, source on
 `feature/SUMO-588_func_test_flicker`, no matching branch yet — default
@@ -156,12 +176,14 @@ Git commit/amend helpers live in `scripts/skill_git.py` (imported, not a CLI).
 
 ## Multiple repositories
 
-`/update-src-rev for each of <repo_a> <repo_b> <repo_c>` runs the full
-skill once per named repo, in order. **Pre-flight (batch):** every named
-repo must be on the **same branch name** (source repos use their current
-branch; meta layers use the layer branch). If they differ, the script
-stops with `PREFLIGHT: action required` unless
-`--continue-preflight` is passed.
+`/update-src-rev for each of <repo_a> <repo_b> <repo_c>` or
+`/update-src-rev in order: <repo_a>, <repo_b>, <repo_c>` runs the full
+skill once per named repo, in order. The script strips the `for each of`
+and `in order:` prefixes and ignores commas in the repo list.
+**Pre-flight (batch):** every named repo must be on the **same branch
+name** (source repos use their current branch; meta layers use the layer
+branch). If they differ, the script stops with
+`PREFLIGHT: action required` unless `--continue-preflight` is passed.
 
 Each per-repo run is otherwise independent: its own pre-flight, recipe
 SRCREV (when applicable), and manifest pins.
@@ -193,6 +215,7 @@ into one summary.
 | `--issue` | Issue id for commit messages. |
 | `--no-commit` | Update files only; no commits. |
 | `--base-existing` | New meta-layer/workspace branch from current checkout, not `main`. |
+| `--recreate-branch` | Existing target branch diverged from current checkout; recreate target from current (`checkout -B`). |
 | `--allow-dirty-source` | Pin source `HEAD` despite uncommitted source changes. |
 | `--fix-preflight` | Update local `main` branches and rename underscores. |
 | `--continue-preflight` | Continue with pre-flight issues unchanged. |
@@ -331,7 +354,10 @@ Manifest (one commit). Title formula:
 `{branch}` is the source-repo branch name (example:
 `feature/SUMO-588_func_test_flicker`). The body lists source project
 and recipe project name, path, and revision (plus recipe path and
-SRCREV when known):
+SRCREV when known). When a manifest commit is amended for another
+repo, prior project sections are kept and new ones are appended; an
+existing section's `path:` value is extended with the new path instead
+of replacing the whole body:
 
 ```text
 SUMO-588:feature/SUMO-588_func_test_flicker Update SRCREV
@@ -367,10 +393,13 @@ When the user wants this operation:
 4. If the script exits with **`PREFLIGHT: action required`** (exit
    code 2), use **AskQuestion**. For main freshness or underscore
    problems, offer `yes` (`--fix-preflight`), `abort`, or `continue`
-   (`--continue-preflight`). For existing dirty-repo and new-branch
-   questions, resolve them as before, then re-run with the appropriate
-   flags. Accept `y` for yes, `a`, `no`, or `n` for abort, and `c` for
-   continue.
+   (`--continue-preflight`). For diverged existing target branches,
+   offer `recreate` (`--recreate-branch`), `continue`
+   (`--continue-preflight`, checkout stale target as-is), or `abort`.
+   For new-branch base questions, offer `main` (default),
+   `current` (`--base-existing`), or `abort`. For dirty-repo
+   questions, resolve as before. Accept `y` for yes, `a`, `no`, or `n`
+   for abort, and `c` for continue.
 5. On success, run without `-n` unless the user asked for dry-run only.
 6. **Report** that same layout from the script. Include push hints and
    any push warnings.
@@ -399,6 +428,9 @@ retry blindly; inspect git state in both repos before re-running.
 | Dirty source repo | Ask user; `--allow-dirty-source` or clean source. |
 | Dirty meta/workspace before switch | Commit or stash; re-run. |
 | New branch, not on `main` | Ask `main` vs current; `--base-existing` for current. |
+| Existing target diverges from current | Ask recreate (`--recreate-branch`), continue (`--continue-preflight`), or abort. |
+| `in order:` / comma-separated repo list | Parsed automatically; commas and `in order:` are stripped. |
+| After `rebase-redo` | Manifest may be on `branch_b`; use `--recreate-branch` when aligning to `branch_a`. |
 | Detached HEAD | Check out a named branch first. |
 | Multiple recipes match | List paths; ask which `--recipe`. |
 | No issue in branch name | Ask for issue id or pass `--issue`. |

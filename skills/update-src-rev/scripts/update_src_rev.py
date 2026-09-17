@@ -35,6 +35,7 @@ from skill_git import (
     find_workspace_root,
     git_ref_exists,
     git_try,
+    head_is_kind,
     is_git_repo,
     is_revision_only_diff,
     is_srcrev_only_diff,
@@ -233,11 +234,105 @@ def rename_current_branch(repo: Path, old: str, new: str) -> None:
     run_git(["branch", "-m", new], repo)
 
 
+def is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
+    """True when ancestor is contained in descendant's history."""
+    return (
+        git_try(
+            ["merge-base", "--is-ancestor", ancestor, descendant], repo
+        ).returncode
+        == 0
+    )
+
+
+def existing_target_ref(repo: Path, target_branch: str) -> str | None:
+    """Return local or origin ref for target_branch, or None."""
+    local_ref = f"refs/heads/{target_branch}"
+    if git_ref_exists(repo, local_ref):
+        return target_branch
+    remote_ref = f"refs/remotes/origin/{target_branch}"
+    if git_ref_exists(repo, remote_ref):
+        return f"origin/{target_branch}"
+    return None
+
+
+def branch_histories_compatible(
+    repo: Path, current: str, target_ref: str
+) -> bool:
+    """True when checking out target_ref does not abandon current."""
+    if is_ancestor(repo, current, target_ref):
+        return True
+    if is_ancestor(repo, target_ref, current):
+        return True
+    return False
+
+
+def recreate_branch_from_current(
+    repo: Path,
+    target_branch: str,
+    current: str,
+    dry_run: bool,
+) -> tuple[str, str]:
+    """Reset target_branch to the current checkout."""
+    sha = run_git(["rev-parse", "HEAD"], repo)
+    if dry_run:
+        return sha, (
+            f"would recreate branch {target_branch} from {current}"
+        )
+    run_git(["checkout", "-B", target_branch], repo)
+    return run_git(["rev-parse", "HEAD"], repo), (
+        f"recreated branch {target_branch} from {current}"
+    )
+
+
+def check_branch_divergence(
+    repo: Path,
+    label: str,
+    rel: str,
+    current: str,
+    target: str,
+    args: argparse.Namespace,
+) -> None:
+    """Stop when an existing target branch diverges from current."""
+    if current == target:
+        return
+    target_ref = existing_target_ref(repo, target)
+    if not target_ref:
+        return
+    if branch_histories_compatible(repo, current, target_ref):
+        return
+    if args.recreate_branch or args.continue_preflight:
+        return
+    current_sha = run_git(["rev-parse", current], repo)
+    target_sha = run_git(["rev-parse", target_ref], repo)
+    preflight_exit(
+        [
+            (
+                f"{label} ({rel}) is on {current} but {target} has "
+                "diverged history (not stacked on the current checkout)."
+            ),
+            f"  current: {current_sha[:12]} ({current})",
+            f"  target:  {target_sha[:12]} ({target_ref})",
+            "Ask the user:",
+            (
+                f"  - recreate: re-run with --recreate-branch to reset "
+                f"{target} from the current checkout ({current})"
+            ),
+            (
+                "  - continue: re-run with --continue-preflight to "
+                "checkout the existing branch as-is (may drop work "
+                "from the current checkout)"
+            ),
+            "  - abort: stop without changes",
+        ]
+    )
+
+
 def branch_alignment_plan(
     repo: Path,
     target_branch: str,
     base_existing: bool,
     dry_run: bool,
+    recreate_branch: bool = False,
 ) -> tuple[str, str]:
     """Plan or apply branch alignment. Return (HEAD SHA, human note)."""
     current = current_branch(repo)
@@ -254,6 +349,11 @@ def branch_alignment_plan(
     remote_ref = f"refs/remotes/origin/{target_branch}"
 
     if git_ref_exists(repo, local_ref):
+        if not branch_histories_compatible(repo, current, target_branch):
+            if recreate_branch:
+                return recreate_branch_from_current(
+                    repo, target_branch, current, dry_run
+                )
         sha = run_git(["rev-parse", local_ref], repo)
         if dry_run:
             return sha, f"would checkout existing branch {target_branch}"
@@ -263,13 +363,16 @@ def branch_alignment_plan(
         )
 
     if git_ref_exists(repo, remote_ref):
+        origin_ref = f"origin/{target_branch}"
+        if not branch_histories_compatible(repo, current, origin_ref):
+            if recreate_branch:
+                return recreate_branch_from_current(
+                    repo, target_branch, current, dry_run
+                )
         sha = run_git(["rev-parse", remote_ref], repo)
         if dry_run:
             return sha, f"would checkout existing origin/{target_branch}"
-        run_git(
-            ["checkout", "-B", target_branch, f"origin/{target_branch}"],
-            repo,
-        )
+        run_git(["checkout", "-B", target_branch, origin_ref], repo)
         return run_git(["rev-parse", "HEAD"], repo), (
             f"checked out existing origin/{target_branch}"
         )
@@ -290,9 +393,7 @@ def needs_branch_base_choice(
     current = current_branch(repo)
     if not current or current == target_branch:
         return False
-    local_ref = f"refs/heads/{target_branch}"
-    remote_ref = f"refs/remotes/origin/{target_branch}"
-    if git_ref_exists(repo, local_ref) or git_ref_exists(repo, remote_ref):
+    if existing_target_ref(repo, target_branch):
         return False
     if current == "main":
         return False
@@ -427,6 +528,10 @@ def run_preflight_meta_layer(
                 ]
             )
 
+        check_branch_divergence(
+            repo, label, rel, current, target, args
+        )
+
         if needs_branch_base_choice(repo, target, args.base_existing):
             preflight_exit(
                 [
@@ -452,7 +557,11 @@ def run_preflight_meta_layer(
             )
 
     _, note = branch_alignment_plan(
-        repo, target, args.base_existing, dry_run
+        repo,
+        target,
+        args.base_existing,
+        dry_run,
+        recreate_branch=args.recreate_branch,
     )
     lines.append(
         RepoPreflightLine(
@@ -615,6 +724,10 @@ def run_preflight(
                     ]
                 )
 
+            check_branch_divergence(
+                repo, label, rel, current, target, args
+            )
+
             if needs_branch_base_choice(repo, target, args.base_existing):
                 preflight_exit(
                     [
@@ -640,7 +753,11 @@ def run_preflight(
                 )
 
         head, note = branch_alignment_plan(
-            repo, target, args.base_existing, dry_run
+            repo,
+            target,
+            args.base_existing,
+            dry_run,
+            recreate_branch=args.recreate_branch,
         )
         line = RepoPreflightLine(
             label=label,
@@ -1760,6 +1877,126 @@ def issue_for_meta_layer(
     )
 
 
+MANIFEST_BODY_FIELD_ORDER = ("name", "path", "revision", "recipe", "SRCREV")
+
+
+@dataclass
+class ManifestCommitSection:
+    header: str
+    fields: dict[str, str]
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return (self.header, self.fields.get("name", ""))
+
+
+def parse_manifest_commit_body(body: str) -> list[ManifestCommitSection]:
+    """Parse a manifest commit body into project sections."""
+    sections: list[ManifestCommitSection] = []
+    current_header = ""
+    current_fields: dict[str, str] = {}
+
+    def flush() -> None:
+        nonlocal current_header, current_fields
+        if current_header:
+            sections.append(
+                ManifestCommitSection(current_header, dict(current_fields))
+            )
+        current_header = ""
+        current_fields = {}
+
+    for line in body.splitlines():
+        if line.endswith(":") and not line.startswith(" "):
+            flush()
+            current_header = line
+            continue
+        if not current_header or not line.startswith("  "):
+            continue
+        stripped = line.strip()
+        if ": " not in stripped:
+            continue
+        key, value = stripped.split(": ", 1)
+        current_fields[key] = value
+    flush()
+    return sections
+
+
+def append_manifest_path(existing: str, new_path: str) -> str:
+    """Append a path to an existing comma-separated path value."""
+    paths = [part.strip() for part in existing.split(",") if part.strip()]
+    if new_path not in paths:
+        paths.append(new_path)
+    return ", ".join(paths)
+
+
+def render_manifest_commit_body(sections: list[ManifestCommitSection]) -> str:
+    blocks: list[str] = []
+    for section in sections:
+        lines = [section.header]
+        rendered: set[str] = set()
+        for key in MANIFEST_BODY_FIELD_ORDER:
+            if key not in section.fields:
+                continue
+            lines.append(f"  {key}: {section.fields[key]}")
+            rendered.add(key)
+        for key, value in section.fields.items():
+            if key in rendered:
+                continue
+            lines.append(f"  {key}: {value}")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+def merge_manifest_commit_bodies(existing: str, new: str) -> str:
+    """Merge manifest commit bodies, appending paths instead of replacing."""
+    existing = existing.strip()
+    new = new.strip()
+    if not existing:
+        return new
+    if not new:
+        return existing
+
+    merged: dict[tuple[str, str], ManifestCommitSection] = {}
+    order: list[tuple[str, str]] = []
+
+    for section in parse_manifest_commit_body(existing):
+        merged[section.key] = ManifestCommitSection(
+            section.header, dict(section.fields)
+        )
+        order.append(section.key)
+
+    for section in parse_manifest_commit_body(new):
+        key = section.key
+        if key in merged:
+            target = merged[key]
+            for field, value in section.fields.items():
+                if field == "path":
+                    current = target.fields.get("path", "")
+                    target.fields["path"] = append_manifest_path(
+                        current, value
+                    )
+                else:
+                    target.fields[field] = value
+            continue
+        merged[key] = ManifestCommitSection(
+            section.header, dict(section.fields)
+        )
+        order.append(key)
+
+    return render_manifest_commit_body([merged[key] for key in order])
+
+
+def with_amended_manifest_body(repo: Path, message: str) -> str:
+    """When amending a revision-only manifest commit, merge commit bodies."""
+    subject, sep, new_body = message.partition("\n\n")
+    if not sep or not head_is_kind(repo, is_revision_only_diff):
+        return message
+    existing = run_git(["log", "-1", "--format=%B"], repo)
+    _, _, existing_body = existing.partition("\n\n")
+    merged_body = merge_manifest_commit_bodies(existing_body, new_body)
+    return f"{subject}\n\n{merged_body}"
+
+
 def manifest_self_body_lines(self_pin: ManifestPinResult) -> list[str]:
     if not self_pin.changed:
         return []
@@ -1872,6 +2109,7 @@ def commit_meta_layer_manifest(
     message = manifest_commit_message_meta_layer(
         issue, ctx.src_branch, recipe_pin, self_pin
     )
+    message = with_amended_manifest_body(repo, message)
     commit_or_amend(
         repo, rel, message, is_revision_only_diff, quiet=True
     )
@@ -1900,6 +2138,7 @@ def commit_manifest_bundle(
     message = manifest_commit_message(
         issue, recipe.src_branch, recipe, pins, self_pin
     )
+    message = with_amended_manifest_body(repo, message)
     commit_or_amend(
         repo, rel, message, is_revision_only_diff, quiet=True
     )
@@ -1979,17 +2218,29 @@ def run_multi_repo_branch_preflight(
     )
 
 
+def strip_repo_list_prefix(text: str) -> str:
+    """Remove optional skill prefixes from a repo-list token."""
+    lowered = text.lower()
+    if lowered.startswith("for each of "):
+        return text[len("for each of ") :].strip()
+    if lowered.startswith("in order:"):
+        return text[len("in order:") :].strip()
+    if lowered.startswith("in order "):
+        return text[len("in order ") :].strip()
+    return text
+
+
 def parse_repo_list(raw_repos: list[str]) -> list[str]:
-    """Normalize repo CLI args; strip optional 'for each of' prefix."""
+    """Normalize repo CLI args; strip skill prefixes and commas."""
     repos: list[str] = []
     for raw in raw_repos:
-        text = raw.strip()
+        text = strip_repo_list_prefix(raw.strip())
         if not text:
             continue
-        lowered = text.lower()
-        if lowered.startswith("for each of "):
-            text = text[len("for each of ") :]
-        repos.extend(part for part in text.split() if part)
+        for part in text.replace(",", " ").split():
+            token = part.strip()
+            if token:
+                repos.append(token)
     if not repos:
         raise SystemExit("ERROR: repo name is required")
     return repos
@@ -2046,6 +2297,16 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Create a new meta-layer or workspace branch from the current "
             "checkout instead of main (default: False)"
+        ),
+    )
+    parser.add_argument(
+        "--recreate-branch",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "When an existing target branch diverges from the current "
+            "checkout, recreate it from the current branch instead of "
+            "checking out the stale ref (default: False)"
         ),
     )
     parser.add_argument(
