@@ -42,7 +42,10 @@ from skill_git import (
     path_is_dirty,
     push_branch_warnings,
     push_needed,
+    repo_has_tracked_changes,
     repo_is_dirty,
+    repo_is_untracked_only,
+    repo_untracked_sample,
     run_git,
     workspace_rel,
 )
@@ -177,23 +180,254 @@ def remote_main_sha(repo: Path) -> str:
     return fields[0] if fields else ""
 
 
-def main_sync_issue(repo: Path) -> str | None:
-    """Describe why the local main branch is not current with origin."""
+MainSyncKind = Literal["behind", "diverged", "no_local", "no_remote"]
+
+DIVERGED_MAIN_PLAYBOOK = [
+    (
+        "Diverged local main cannot be fixed by --fix-preflight "
+        "(only fast-forward)."
+    ),
+    "Typical recovery in each affected repo:",
+    "  git checkout main",
+    "  git pull origin main",
+    "  git checkout <your-feature-branch>",
+    "  git rebase main",
+    (
+        "Re-run update-src-rev afterward; step 3 may need a new "
+        "meta-layer manifest pin."
+    ),
+]
+
+
+@dataclass(frozen=True)
+class MainSyncProblem:
+    kind: MainSyncKind
+    label: str
+    repo: Path
+    message: str
+
+
+def main_sync_problem(label: str, repo: Path) -> MainSyncProblem | None:
+    """Classify why local main is not current with origin/main."""
     local_ref = "refs/heads/main"
     local_exists = git_ref_exists(repo, local_ref)
     remote_sha = remote_main_sha(repo)
     if not remote_sha:
-        return "origin/main could not be read"
+        return MainSyncProblem(
+            "no_remote",
+            label,
+            repo,
+            f"{label} ({repo}): origin/main could not be read",
+        )
     if not local_exists:
-        return "local main branch does not exist"
+        return MainSyncProblem(
+            "no_local",
+            label,
+            repo,
+            f"{label} ({repo}): local main branch does not exist",
+        )
     local_sha = run_git(["rev-parse", local_ref], repo)
     if local_sha == remote_sha:
         return None
     if git_try(
         ["merge-base", "--is-ancestor", local_sha, remote_sha], repo
     ).returncode == 0:
-        return "local main is behind origin/main"
-    return "local main has diverged from origin/main"
+        return MainSyncProblem(
+            "behind",
+            label,
+            repo,
+            f"{label} ({repo}): local main is behind origin/main",
+        )
+    return MainSyncProblem(
+        "diverged",
+        label,
+        repo,
+        f"{label} ({repo}): local main has diverged from origin/main",
+    )
+
+
+def handle_main_sync_problems(
+    repos: list[tuple[str, Path]],
+    args: argparse.Namespace,
+    dry_run: bool,
+    warnings: list[str],
+) -> None:
+    """Fetch/ff main when fixable; stop or warn on diverged main."""
+    problems = [
+        p
+        for label, repo in repos
+        for p in [main_sync_problem(label, repo)]
+        if p is not None
+    ]
+    if not problems:
+        return
+
+    messages = [p.message for p in problems]
+    has_diverged = any(p.kind == "diverged" for p in problems)
+    has_no_remote = any(p.kind == "no_remote" for p in problems)
+    fixable_kinds = frozenset({"behind", "no_local"})
+    manual_main = has_diverged or has_no_remote
+
+    if manual_main and args.fix_preflight:
+        eprint(
+            "ERROR: --fix-preflight cannot fix diverged local main or "
+            "unreadable origin/main; resolve manually or use "
+            "--continue-preflight."
+        )
+        eprint("")
+        if has_diverged:
+            for line in DIVERGED_MAIN_PLAYBOOK:
+                eprint(line)
+        raise SystemExit(1)
+
+    if manual_main:
+        if args.continue_preflight:
+            warnings.extend(messages)
+            return
+        paragraphs = [
+            "The following main branches are not up to date:",
+            *[f"  - {m}" for m in messages],
+        ]
+        if has_diverged:
+            paragraphs.extend(DIVERGED_MAIN_PLAYBOOK)
+        paragraphs.append(
+            "Ask the user whether to abort or continue with "
+            "--continue-preflight. Do not offer --fix-preflight when "
+            "main has diverged or origin/main cannot be read."
+        )
+        preflight_exit(paragraphs)
+
+    if args.fix_preflight:
+        if not dry_run:
+            for problem in problems:
+                if problem.kind in fixable_kinds:
+                    update_local_main(problem.repo)
+        else:
+            warnings.extend(messages)
+        return
+
+    if args.continue_preflight:
+        warnings.extend(messages)
+        return
+
+    preflight_exit(
+        [
+            "The following main branches are not up to date:",
+            *[f"  - {m}" for m in messages],
+            (
+                "Ask the user whether to fix them (fetch and "
+                "fast-forward main), abort, or continue without "
+                "changes."
+            ),
+        ]
+    )
+
+
+def check_source_workspace_branch_alignment(
+    ctx: SkillContext,
+    args: argparse.Namespace,
+    warnings: list[str],
+) -> None:
+    """Stop when source and workspace are on different branch names."""
+    if ctx.meta_layer_only or ctx.src_repo is None:
+        return
+    src_branch = current_branch(ctx.src_repo)
+    ws_branch = current_branch(ctx.manifest_repo)
+    if not src_branch or not ws_branch or src_branch == ws_branch:
+        return
+    rel = ctx.src_rel
+    ws_rel = ctx.manifest_repo_rel
+    detail = (
+        f"Source repo {rel} is on {src_branch} but workspace "
+        f"{ws_rel} is on {ws_branch}. Pins use the source branch "
+        f"({src_branch}), not the workspace branch."
+    )
+    if args.continue_preflight:
+        warnings.append(detail)
+        return
+    preflight_exit(
+        [
+            detail,
+            (
+                f"Check out {rel} on {ws_branch} (or the branch you "
+                "intend to pin) before continuing."
+            ),
+            (
+                "Ask the user whether to abort or continue with "
+                "--continue-preflight if pinning from the source "
+                "branch is intentional."
+            ),
+        ]
+    )
+
+
+def source_dirty_preflight(
+    ctx: SkillContext,
+    args: argparse.Namespace,
+    target: str,
+    lines: list[RepoPreflightLine],
+    warnings: list[str],
+) -> None:
+    """Record source cleanliness; block on tracked edits, warn on untracked."""
+    if ctx.src_repo is None:
+        return
+    rel = ctx.src_rel
+    if not repo_is_dirty(ctx.src_repo):
+        lines.append(
+            RepoPreflightLine(
+                label="Source",
+                rel=rel,
+                branch=target,
+                note="clean",
+            )
+        )
+        return
+
+    if repo_is_untracked_only(ctx.src_repo):
+        sample = repo_untracked_sample(ctx.src_repo)
+        extra = ""
+        if sample:
+            shown = ", ".join(sample)
+            if len(sample) >= 5:
+                shown += ", ..."
+            extra = f" (e.g. {shown})"
+        warnings.append(
+            f"Source repo {rel} has untracked files only{extra}; "
+            "pin uses committed HEAD."
+        )
+        lines.append(
+            RepoPreflightLine(
+                label="Source",
+                rel=rel,
+                branch=target,
+                note="untracked files only",
+            )
+        )
+        return
+
+    if not args.allow_dirty_source:
+        preflight_exit(
+            [
+                (
+                    f"Source repo {rel} has uncommitted tracked changes. "
+                    "The pin will use the current HEAD, which may "
+                    "include uncommitted work."
+                ),
+                (
+                    "Ask the user whether to continue. Re-run with "
+                    "--allow-dirty-source to pin the current HEAD, "
+                    "or commit/stash in the source repo first."
+                ),
+            ]
+        )
+    lines.append(
+        RepoPreflightLine(
+            label="Source",
+            rel=rel,
+            branch=target,
+            note="has uncommitted changes (--allow-dirty-source)",
+        )
+    )
 
 
 def update_local_main(repo: Path) -> None:
@@ -410,35 +644,15 @@ def run_preflight_meta_layer(
     target = ctx.src_branch
     warnings: list[str] = []
 
-    main_issues: list[str] = []
-    for label, repo in (
-        ("Meta layer", ctx.meta_repo),
-        ("Workspace", ctx.manifest_repo),
-    ):
-        issue = main_sync_issue(repo)
-        if issue:
-            main_issues.append(f"{label} ({repo}): {issue}")
-
-    if main_issues:
-        if args.fix_preflight and not dry_run:
-            for repo in (ctx.meta_repo, ctx.manifest_repo):
-                update_local_main(repo)
-        elif args.fix_preflight:
-            warnings.extend(main_issues)
-        elif args.continue_preflight:
-            warnings.extend(main_issues)
-        else:
-            preflight_exit(
-                [
-                    "The following main branches are not up to date:",
-                    *[f"  - {issue}" for issue in main_issues],
-                    (
-                        "Ask the user whether to fix them (fetch and "
-                        "fast-forward main), abort, or continue without "
-                        "changes."
-                    ),
-                ]
-            )
+    handle_main_sync_problems(
+        (
+            ("Meta layer", ctx.meta_repo),
+            ("Workspace", ctx.manifest_repo),
+        ),
+        args,
+        dry_run,
+        warnings,
+    )
 
     if "_" in target:
         replacement = target.replace("_", "-")
@@ -469,13 +683,13 @@ def run_preflight_meta_layer(
     meta_planned_head = run_git(["rev-parse", "HEAD"], ctx.meta_repo)
     meta_note = "defines target branch"
 
-    if repo_is_dirty(ctx.meta_repo):
+    if repo_has_tracked_changes(ctx.meta_repo):
         if not args.allow_dirty_source:
             preflight_exit(
                 [
                     (
-                        f"Meta layer {ctx.meta_rel} has uncommitted changes. "
-                        "The pin uses committed HEAD only."
+                        f"Meta layer {ctx.meta_rel} has uncommitted "
+                        "tracked changes. The pin uses committed HEAD only."
                     ),
                     (
                         "Ask the user whether to continue. Re-run with "
@@ -490,6 +704,19 @@ def run_preflight_meta_layer(
                 rel=ctx.meta_rel,
                 branch=target,
                 note="has uncommitted changes (--allow-dirty-source)",
+            )
+        )
+    elif repo_is_untracked_only(ctx.meta_repo):
+        warnings.append(
+            f"Meta layer {ctx.meta_rel} has untracked files only; "
+            "pin uses committed HEAD."
+        )
+        lines.append(
+            RepoPreflightLine(
+                label="Meta layer",
+                rel=ctx.meta_rel,
+                branch=target,
+                note="untracked files only",
             )
         )
     else:
@@ -513,13 +740,13 @@ def run_preflight_meta_layer(
         )
 
     if current != target:
-        if repo_is_dirty(repo):
+        if repo_has_tracked_changes(repo):
             preflight_exit(
                 [
                     (
                         f"{label} ({rel}) is on {current} but the "
                         f"meta-layer branch is {target}, and the repo "
-                        "has uncommitted changes."
+                        "has uncommitted tracked changes."
                     ),
                     (
                         "Commit or stash changes in that repo, then "
@@ -598,36 +825,18 @@ def run_preflight(
     target = original_target
     warnings: list[str] = []
 
-    main_issues: list[str] = []
-    for label, repo in (
-        ("Source repo", ctx.src_repo),
-        ("Meta layer", ctx.meta_repo),
-        ("Workspace", ctx.manifest_repo),
-    ):
-        issue = main_sync_issue(repo)
-        if issue:
-            main_issues.append(f"{label} ({repo}): {issue}")
+    check_source_workspace_branch_alignment(ctx, args, warnings)
 
-    if main_issues:
-        if args.fix_preflight and not dry_run:
-            for repo in (ctx.src_repo, ctx.meta_repo, ctx.manifest_repo):
-                update_local_main(repo)
-        elif args.fix_preflight:
-            warnings.extend(main_issues)
-        elif args.continue_preflight:
-            warnings.extend(main_issues)
-        else:
-            preflight_exit(
-                [
-                    "The following main branches are not up to date:",
-                    *[f"  - {issue}" for issue in main_issues],
-                    (
-                        "Ask the user whether to fix them (fetch and "
-                        "fast-forward main), abort, or continue without "
-                        "changes."
-                    ),
-                ]
-            )
+    handle_main_sync_problems(
+        (
+            ("Source repo", ctx.src_repo),
+            ("Meta layer", ctx.meta_repo),
+            ("Workspace", ctx.manifest_repo),
+        ),
+        args,
+        dry_run,
+        warnings,
+    )
 
     if "_" in target:
         replacement = target.replace("_", "-")
@@ -662,40 +871,7 @@ def run_preflight(
     meta_planned_head = run_git(["rev-parse", "HEAD"], ctx.meta_repo)
     meta_note = "already on matching branch"
 
-    if repo_is_dirty(ctx.src_repo):
-        if not args.allow_dirty_source:
-            rel = ctx.src_rel
-            preflight_exit(
-                [
-                    (
-                        f"Source repo {rel} has uncommitted changes. "
-                        "The pin will use the current HEAD, which may "
-                        "include uncommitted work."
-                    ),
-                    (
-                        "Ask the user whether to continue. Re-run with "
-                        "--allow-dirty-source to pin the current HEAD, "
-                        "or commit/stash in the source repo first."
-                    ),
-                ]
-            )
-        lines.append(
-            RepoPreflightLine(
-                label="Source",
-                rel=ctx.src_rel,
-                branch=target,
-                note="has uncommitted changes (--allow-dirty-source)",
-            )
-        )
-    else:
-        lines.append(
-            RepoPreflightLine(
-                label="Source",
-                rel=ctx.src_rel,
-                branch=target,
-                note="clean",
-            )
-        )
+    source_dirty_preflight(ctx, args, target, lines, warnings)
 
     for label, repo, rel in (
         ("Meta layer", ctx.meta_repo, ctx.meta_rel),
@@ -709,7 +885,7 @@ def run_preflight(
             )
 
         if current != target:
-            if repo_is_dirty(repo):
+            if repo_has_tracked_changes(repo):
                 preflight_exit(
                     [
                         (
@@ -1019,6 +1195,14 @@ def find_srcrev_targets(content: str, repo_name: str) -> list[str]:
     return resolved
 
 
+def is_primary_recipe_for_repo(path: Path, repo_name: str) -> bool:
+    """True when the recipe file is the canonical owner for the source repo."""
+    stem = path.stem
+    if stem in {repo_name, f"{repo_name}_git"}:
+        return True
+    return path.parent.name == repo_name
+
+
 def discover_recipes(layers: list[Path], repo_name: str) -> list[Path]:
     matches: list[Path] = []
     for layer in layers:
@@ -1033,6 +1217,20 @@ def discover_recipes(layers: list[Path], repo_name: str) -> list[Path]:
                 if find_srcrev_targets(content, repo_name):
                     matches.append(path)
     return sorted(matches)
+
+
+def choose_recipe_match(matches: list[Path], repo_name: str) -> Path:
+    """Pick one recipe when several reference the same src path."""
+    primary = [p for p in matches if is_primary_recipe_for_repo(p, repo_name)]
+    if len(primary) == 1:
+        return primary[0]
+    if len(matches) == 1:
+        return matches[0]
+    listing = "\n".join(f"  - {path}" for path in matches)
+    raise SystemExit(
+        "ERROR: multiple recipes reference "
+        f"src/{repo_name}; pass --recipe:\n{listing}"
+    )
 
 
 def choose_srcrev_vars(content: str, repo_name: str) -> list[str]:
@@ -1102,13 +1300,7 @@ def resolve_recipe(
         raise SystemExit(
             f"ERROR: no .bb/.inc recipe found for src/{repo_name}{scope}"
         )
-    if len(matches) > 1:
-        listing = "\n".join(f"  - {path}" for path in matches)
-        raise SystemExit(
-            "ERROR: multiple recipes reference "
-            f"src/{repo_name}; pass --recipe:\n{listing}"
-        )
-    return matches[0]
+    return choose_recipe_match(matches, repo_name)
 
 
 def source_branch_name(src_repo: Path) -> str:
@@ -2321,8 +2513,9 @@ def parse_args() -> argparse.Namespace:
         "--fix-preflight",
         action="store_true",
         help=(
-            "Fetch and fast-forward main, and rename source branches "
-            "to replace underscores with hyphens"
+            "Fetch and fast-forward local main when behind origin/main "
+            "(not when main has diverged), and rename branches to "
+            "replace underscores with hyphens"
         ),
     )
     parser.add_argument(

@@ -76,25 +76,57 @@ Before steps 1–3, the script checks the `main` branch in the source,
 meta-layer, and workspace repositories against `origin/main`. It also
 verifies that the source branch name contains no underscores.
 
-If a main branch is behind or missing, fixing fetches `origin/main` and
-fast-forwards or creates local `main`. A diverged main branch must be
-resolved manually.
+If a main branch is **behind** `origin/main` or **missing** locally,
+`--fix-preflight` fetches `origin/main` and fast-forwards or creates
+local `main`. If local `main` has **diverged** from `origin/main`,
+`--fix-preflight` is rejected (dry-run and apply); the user must fix
+`main` manually, then re-run the skill.
+
+**Diverged `main` recovery** (typical, per affected git repo):
+
+```text
+git checkout main
+git pull origin main
+git checkout <your-feature-branch>
+git rebase main
+```
+
+After rebasing a meta layer, re-run update-src-rev so step 3 pins the
+new meta-layer `HEAD` in `default.xml`.
 
 If the source branch contains underscores, fixing renames the current
 local source, meta-layer, and workspace branches when possible. The
 remote branch is not renamed or pushed.
 
-When a check fails, the agent must use `AskQuestion` and offer:
+When **only** behind/missing `main` is reported, the agent must use
+`AskQuestion` and offer:
 
 - `yes`: pass `--fix-preflight` and let the skill make the fixes.
 - `abort`: stop the skill without changing anything.
 - `continue`: pass `--continue-preflight` and continue unchanged.
+
+When **diverged** `main` is reported, offer **abort** or **continue**
+only (`--continue-preflight`). Do **not** offer `--fix-preflight`.
 
 The agent must also accept `y` for `yes`, `a`, `no`, or `n` for
 `abort`, and `c` for `continue`.
 
 The default is to stop with `PREFLIGHT: action required`; never choose
 `continue` without the user's explicit choice.
+
+If the **source repo branch name** differs from the **workspace**
+branch (for example source on `main`, manifest on `feature/...`), the
+skill stops unless `--continue-preflight`. Checkout the source repo on
+the intended feature branch before pinning.
+
+**Untracked-only** dirt in the source or meta layer is a warning; the
+pin uses committed `HEAD`. **Tracked** uncommitted changes still require
+`--allow-dirty-source` or commit/stash.
+
+Recipe discovery prefers the canonical recipe when several `.bb` files
+reference the same `src/<name>` (for example
+`recipes-.../<name>/<name>_git.bb`). Pass `--recipe` when ambiguity
+remains.
 
 After these checks, the script aligns the **meta-layer** and
 **workspace** (manifest) repos to the **source repo branch name**:
@@ -217,7 +249,7 @@ into one summary.
 | `--base-existing` | New meta-layer/workspace branch from current checkout, not `main`. |
 | `--recreate-branch` | Existing target branch diverged from current checkout; recreate target from current (`checkout -B`). |
 | `--allow-dirty-source` | Pin source `HEAD` despite uncommitted source changes. |
-| `--fix-preflight` | Update local `main` branches and rename underscores. |
+| `--fix-preflight` | Fast-forward local `main` when behind (not diverged); rename underscores. |
 | `--continue-preflight` | Continue with pre-flight issues unchanged. |
 | `-n` / `--dry-run` | Dry-run only; do not write, commit, or switch branches. |
 
@@ -391,7 +423,12 @@ When the user wants this operation:
    (pre-flight + three steps + final result + push hints) without
    rewriting the layout.
 4. If the script exits with **`PREFLIGHT: action required`** (exit
-   code 2), use **AskQuestion**. For main freshness or underscore
+   code 2), use **AskQuestion**. For main **behind/missing**, offer
+   `yes` (`--fix-preflight`), `abort`, or `continue`
+   (`--continue-preflight`). For **diverged** `main`, offer only
+   `abort` or `continue` (include the recovery playbook from the
+   script output). For source vs workspace branch mismatch, offer
+   `abort` or `continue`. For underscore
    problems, offer `yes` (`--fix-preflight`), `abort`, or `continue`
    (`--continue-preflight`). For diverged existing target branches,
    offer `recreate` (`--recreate-branch`), `continue`
@@ -423,16 +460,21 @@ retry blindly; inspect git state in both repos before re-running.
 | Multi-repo branch mismatch | Align every named repo to the same branch, or `--continue-preflight`. |
 | Failure on repo N of M | Earlier repos may already be applied; inspect git state before retry. |
 | `PREFLIGHT: action required` | AskQuestion; re-run with flags or after stash. |
-| Main is stale or diverged | Ask whether to fix, abort, or continue. |
+| Main behind or missing | Offer `--fix-preflight`, abort, or `--continue-preflight`. |
+| Main diverged | Manual recovery playbook; abort or `--continue-preflight` only. |
+| `--fix-preflight` with diverged main | Exit 1; never succeeds until main is fixed manually. |
+| Source branch ≠ workspace branch | Checkout source feature branch; or `--continue-preflight`. |
 | Branch contains `_` | Ask whether to rename, abort, or continue. |
-| Dirty source repo | Ask user; `--allow-dirty-source` or clean source. |
+| Dirty source (tracked) | Ask user; `--allow-dirty-source` or clean source. |
+| Untracked files only | Warning only; pin uses `HEAD`. |
 | Dirty meta/workspace before switch | Commit or stash; re-run. |
 | New branch, not on `main` | Ask `main` vs current; `--base-existing` for current. |
 | Existing target diverges from current | Ask recreate (`--recreate-branch`), continue (`--continue-preflight`), or abort. |
 | `in order:` / comma-separated repo list | Parsed automatically; commas and `in order:` are stripped. |
 | After `rebase-redo` | Manifest may be on `branch_b`; use `--recreate-branch` when aligning to `branch_a`. |
 | Detached HEAD | Check out a named branch first. |
-| Multiple recipes match | List paths; ask which `--recipe`. |
+| Multiple recipes match | Auto-picks canonical `*_git.bb` when unique; else list paths and `--recipe`. |
+| After meta-layer rebase | Re-run skill to refresh step 3 manifest pin. |
 | No issue in branch name | Ask for issue id or pass `--issue`. |
 | SRCREV already matches | Skip recipe commit; still do branch + XML. |
 | Existing SRCREV not in source | Fetch or verify the recipe pin; do not apply. |

@@ -102,10 +102,47 @@ def path_is_dirty(repo: Path, rel: str) -> bool:
     return bool(out.strip())
 
 
+def repo_porcelain_lines(repo: Path) -> list[str]:
+    """Return non-empty ``git status --porcelain`` lines."""
+    out = run_git(["status", "--porcelain"], repo)
+    return [line for line in out.splitlines() if line.strip()]
+
+
 def repo_is_dirty(repo: Path) -> bool:
     """True when the repo has any uncommitted changes."""
-    out = run_git(["status", "--porcelain"], repo)
-    return bool(out.strip())
+    return bool(repo_porcelain_lines(repo))
+
+
+def repo_is_untracked_only(repo: Path) -> bool:
+    """True when dirty state is only untracked files (``??``)."""
+    lines = repo_porcelain_lines(repo)
+    if not lines:
+        return False
+    return all(line.startswith("??") for line in lines)
+
+
+def repo_has_tracked_changes(repo: Path) -> bool:
+    """True when index or worktree has non-untracked changes."""
+    for line in repo_porcelain_lines(repo):
+        if line.startswith("??"):
+            continue
+        return True
+    return False
+
+
+def repo_untracked_sample(repo: Path, limit: int = 5) -> list[str]:
+    """Paths from untracked porcelain lines, at most ``limit``."""
+    paths: list[str] = []
+    for line in repo_porcelain_lines(repo):
+        if not line.startswith("??"):
+            continue
+        path = line[3:].strip()
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        paths.append(path)
+        if len(paths) >= limit:
+            break
+    return paths
 
 
 def current_branch(repo: Path) -> str:
