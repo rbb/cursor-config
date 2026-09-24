@@ -71,6 +71,15 @@ class PushHint:
 
 
 @dataclass
+class RecipePin:
+    path: Path
+    rel: str
+    var_name: str
+    srcrev: str
+    definite: bool
+
+
+@dataclass
 class RecipeResult:
     src_rel: str
     src_branch: str
@@ -85,6 +94,7 @@ class RecipeResult:
     outcome: str
     push_hints: list[PushHint] = field(default_factory=list)
     issue: str | None = None
+    split_pin_mismatches: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1233,6 +1243,141 @@ def choose_recipe_match(matches: list[Path], repo_name: str) -> Path:
     )
 
 
+def read_recipe_pin(
+    recipe: Path, repo_name: str, workspace: Path
+) -> RecipePin | None:
+    """Read the SRCREV pin for src/<repo_name> from one recipe file."""
+    try:
+        content = recipe.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if not recipe_references_repo(content, repo_name):
+        return None
+    targets = find_srcrev_targets(content, repo_name)
+    if not targets:
+        return None
+    var_name = targets[0]
+    srcrev = "?"
+    definite = False
+    for match in SRCREV_LINE_RE.finditer(content):
+        if match.group(1) != var_name:
+            continue
+        srcrev = match.group(3)
+        definite = "?=" not in match.group(2)
+        break
+    return RecipePin(
+        path=recipe.resolve(),
+        rel=recipe_display_path(recipe, workspace),
+        var_name=var_name,
+        srcrev=srcrev,
+        definite=definite,
+    )
+
+
+def collect_recipe_pins(
+    layers: list[Path], repo_name: str, workspace: Path
+) -> list[RecipePin]:
+    pins: list[RecipePin] = []
+    for path in discover_recipes(layers, repo_name):
+        pin = read_recipe_pin(path, repo_name, workspace)
+        if pin is not None:
+            pins.append(pin)
+    return pins
+
+
+def definite_src_pin_mismatches(
+    pins: list[RecipePin],
+    chosen_recipe: Path,
+    target_srcrev: str,
+) -> list[str]:
+    """Other recipes with SRCREV = that do not match the pin target."""
+    chosen = chosen_recipe.resolve()
+    lines: list[str] = []
+    for pin in pins:
+        if not pin.definite:
+            continue
+        if pin.path == chosen:
+            continue
+        if pin.srcrev == target_srcrev:
+            continue
+        lines.append(f"{pin.rel}: {pin.var_name}={pin.srcrev}")
+    return lines
+
+
+def check_definite_src_pin_consistency(
+    args: argparse.Namespace,
+    workspace: Path,
+    repo_name: str,
+    chosen_recipe: Path,
+    target_srcrev: str,
+    primary_old_rev: str,
+) -> list[str]:
+    """
+    Fail when the primary recipe is in sync but other SRCREV = pins lag.
+
+    Recipes that use SRCREV ?= are ignored (intentionally stale defaults).
+    """
+    cwd = Path.cwd()
+    _, layers = resolve_repos(args.repo, cwd, workspace)
+    pins = collect_recipe_pins(layers, repo_name, workspace)
+    mismatches = definite_src_pin_mismatches(
+        pins, chosen_recipe, target_srcrev
+    )
+    if not mismatches:
+        return []
+
+    primary_path = recipe_display_path(chosen_recipe, workspace)
+    if primary_old_rev != target_srcrev:
+        # This run updates the primary recipe; other definite pins still need
+        # their own --recipe pass.
+        if args.allow_split_src_pins:
+            return [
+                "Other definitive SRCREV = pins still differ from source "
+                f"HEAD ({target_srcrev}):",
+                *[f"  - {line}" for line in mismatches],
+            ]
+        eprint(
+            f"ERROR: other recipes pin src/{repo_name} with SRCREV = but "
+            f"this run only updates the primary recipe"
+        )
+        eprint(f"  Primary: {primary_path}")
+        eprint(f"  Source HEAD: {target_srcrev}")
+        eprint("")
+        for line in mismatches:
+            eprint(f"  - {line}")
+        eprint("")
+        eprint(
+            "Update each with --recipe <path>, or pass "
+            "--allow-split-src-pins to continue"
+        )
+        raise SystemExit(1)
+
+    if args.allow_split_src_pins:
+        return [
+            "Other definitive SRCREV = pins differ from source HEAD "
+            f"({target_srcrev}) while the primary recipe is already in "
+            "sync:",
+            *[f"  - {line}" for line in mismatches],
+        ]
+
+    eprint(
+        f"ERROR: primary recipe is pinned to source HEAD but other recipes "
+        f"use SRCREV = for src/{repo_name} at different SHAs"
+    )
+    eprint(f"  Primary: {primary_path}")
+    eprint(f"  Source HEAD: {target_srcrev}")
+    eprint("")
+    for line in mismatches:
+        eprint(f"  - {line}")
+    eprint("")
+    eprint(
+        "The skill only updates one recipe per source repo (the canonical "
+        f"{repo_name}_git.bb when present). Update each stale recipe with "
+        "--recipe <path>, or pass --allow-split-src-pins to ignore."
+    )
+    raise SystemExit(1)
+
+
 def choose_srcrev_vars(content: str, repo_name: str) -> list[str]:
     targets = find_srcrev_targets(content, repo_name)
     if targets:
@@ -1949,17 +2094,22 @@ def print_report(
     applied: list[str] | None = None,
     incomplete: bool = False,
 ) -> None:
+    step1_bullets = [
+        (
+            f"Source: {recipe.src_rel} on {recipe.src_branch} "
+            f"at {recipe.srcrev}"
+        ),
+        f"Recipe: {recipe.recipe_path}",
+        f"Meta layer: {recipe.meta_rel} ({recipe.meta_note})",
+        f"Outcome: {recipe.outcome}",
+    ]
+    if recipe.split_pin_mismatches:
+        step1_bullets.append(
+            "Split SRCREV pins (see pre-flight warnings)"
+        )
     print_step(
         "Step 1 — Recipe SRCREV",
-        [
-            (
-                f"Source: {recipe.src_rel} on {recipe.src_branch} "
-                f"at {recipe.srcrev}"
-            ),
-            f"Recipe: {recipe.recipe_path}",
-            f"Meta layer: {recipe.meta_rel} ({recipe.meta_note})",
-            f"Outcome: {recipe.outcome}",
-        ],
+        step1_bullets,
     )
     source_outcome = source_pin.outcome
     if not source_pin.changed:
@@ -2004,10 +2154,23 @@ def print_report(
             and not source_pin.changed
             and not recipe_pin.changed
             and not self_pin.changed
+            and not recipe.split_pin_mismatches
         ):
             print(
                 "  Everything is already in sync, so an apply run would "
                 "make no commits or file changes."
+            )
+            print()
+        elif recipe.split_pin_mismatches and not (
+            recipe.changed
+            or source_pin.changed
+            or recipe_pin.changed
+            or self_pin.changed
+        ):
+            print(
+                "  Primary recipe and manifest pins are in sync, but other "
+                "SRCREV = recipes still need updates (see pre-flight "
+                "warnings)."
             )
             print()
         elif (
@@ -2524,6 +2687,14 @@ def parse_args() -> argparse.Namespace:
         help="Continue despite preflight issues without changing them",
     )
     parser.add_argument(
+        "--allow-split-src-pins",
+        action="store_true",
+        help=(
+            "Allow other recipes with SRCREV = for the same src/<repo> to "
+            "differ from source HEAD (default: error)"
+        ),
+    )
+    parser.add_argument(
         "-n",
         "--dry-run",
         action="store_true",
@@ -2664,6 +2835,19 @@ def process_repo(
     recipe = update_recipe(
         args, workspace, dry_run=True, preflight=preflight
     )
+    chosen_recipe = (workspace / recipe.recipe_path).resolve()
+    src_repo, _ = resolve_repos(args.repo, Path.cwd(), workspace)
+    split_notes = check_definite_src_pin_consistency(
+        args,
+        workspace,
+        src_repo.name,
+        chosen_recipe,
+        recipe.srcrev,
+        recipe.old_rev,
+    )
+    recipe.split_pin_mismatches = split_notes
+    if split_notes:
+        preflight.warnings.extend(split_notes)
     source_pin = update_manifest_pin(
         workspace,
         manifest,

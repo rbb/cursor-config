@@ -128,6 +128,16 @@ reference the same `src/<name>` (for example
 `recipes-.../<name>/<name>_git.bb`). Pass `--recipe` when ambiguity
 remains.
 
+When the primary recipe is already pinned to source `HEAD`, the script
+also scans other recipes that reference the same `src/<name>`. Any that
+use a definitive assignment (`SRCREV =`, not `SRCREV ?=`) must match
+source `HEAD` as well. If they lag (for example
+`python3-functional-test_git.bb` while the canonical
+`judo-radio-utils_git.bb` was updated), the run **errors** and lists
+each stale recipe. Update them with `--recipe <path>` in separate runs,
+or pass `--allow-split-src-pins` when intentional lag is expected
+(recipes that only use `SRCREV ?=` are not checked).
+
 After these checks, the script aligns the **meta-layer** and
 **workspace** (manifest) repos to the **source repo branch name**:
 
@@ -251,6 +261,7 @@ into one summary.
 | `--allow-dirty-source` | Pin source `HEAD` despite uncommitted source changes. |
 | `--fix-preflight` | Fast-forward local `main` when behind (not diverged); rename underscores. |
 | `--continue-preflight` | Continue with pre-flight issues unchanged. |
+| `--allow-split-src-pins` | Do not error when other `SRCREV =` recipes lag source `HEAD`. |
 | `-n` / `--dry-run` | Dry-run only; do not write, commit, or switch branches. |
 
 Without `-n`, the script **always dry-runs all steps first**, then
@@ -474,6 +485,7 @@ retry blindly; inspect git state in both repos before re-running.
 | After `rebase-redo` | Manifest may be on `branch_b`; use `--recreate-branch` when aligning to `branch_a`. |
 | Detached HEAD | Check out a named branch first. |
 | Multiple recipes match | Auto-picks canonical `*_git.bb` when unique; else list paths and `--recipe`. |
+| Other `SRCREV =` recipes lag | Error with paths; update via `--recipe` or `--allow-split-src-pins`. |
 | After meta-layer rebase | Re-run skill to refresh step 3 manifest pin. |
 | No issue in branch name | Ask for issue id or pass `--issue`. |
 | SRCREV already matches | Skip recipe commit; still do branch + XML. |
