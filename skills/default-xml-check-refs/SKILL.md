@@ -4,9 +4,10 @@ description: >-
   Verifies 40-character SHA1 revision pins in default.xml exist locally and on
   origin; for those pins only, checks alignment with the manifest git branch
   when that branch exists on the project remote (pin must equal branch tip).
-  Ignores non-hash revisions (main, master, tags, etc.) for all checks. Use
-  after update-src-rev, before pushing manifest changes, or for
-  /default-xml-check-refs.
+  For src/* SHA pins, compares manifest revision to BitBake SRCREV = in
+  oe/meta-judo* recipes. Ignores non-hash revisions (main, master, tags,
+  etc.) for manifest ref checks. Use after update-src-rev, before pushing
+  manifest changes, or for /default-xml-check-refs.
 disable-model-invocation: true
 ---
 
@@ -43,6 +44,7 @@ Run from manifest-judo root (or pass `--workspace`).
 | `--no-skip-remote` | Default: verify origin |
 | `--skip-tip` | Pin may be behind `origin/{manifest-branch}` tip |
 | `--no-skip-tip` | Default: pin must equal branch tip when branch exists |
+| `--skip-recipe` | Skip manifest vs BitBake `SRCREV` checks |
 | `-q` / `--quiet` | Print failures and summary only |
 
 Exit **0** when every SHA pin passes; **1** when any check fails.
@@ -74,6 +76,16 @@ Exit **0** when every SHA pin passes; **1** when any check fails.
 
 Non-hash revisions are not listed in the report.
 
+**Recipe alignment** (unless `--skip-recipe`):
+
+- Layers: checked-out manifest projects under `oe/meta-judo*`.
+- Projects: `src/*` with a 40-character manifest `revision`.
+- Recipes: `*.bb` / `*.inc` referencing `src/<name>` with a definitive
+  `SRCREV = "…"` (not `SRCREV ?=`).
+- Fail when manifest `revision` ≠ recipe `SRCREV`, or when they match but
+  the commit is absent from a checked-out `src/<name>` tree (BitBake
+  `do_fetch` / `repo sync` failure).
+
 Manifest URL rule: `{fetch}/{name}.git`.
 
 ## Terminal
@@ -87,7 +99,8 @@ python3 .agents/skills/default-xml-check-refs/scripts/default_xml_check_refs.py
 
 1. **Read** this skill.
 2. **Run** the script; show stdout/stderr.
-3. **Summarize** SHA pin failures only (including `behind_tip`).
+3. **Summarize** manifest pin and recipe SRCREV failures (including
+   `behind_tip` and `mismatch`).
 4. Do not commit generated output.
 
 ## Related

@@ -8,6 +8,11 @@ workspace. Origin and branch checks fetch into a temporary repo so
 repo has a current branch, each pin must exist on a remote branch
 with the same name. When that branch exists, the pin must equal the branch
 tip on origin (not merely be an ancestor).
+
+For src/* projects with SHA pins, scans oe/meta-judo* BitBake recipes
+that reference ``src/<name>`` and requires definitive ``SRCREV =``
+values to match the manifest revision (and to exist in a checked-out
+source tree when present).
 """
 
 from __future__ import annotations
@@ -23,6 +28,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 SHA1_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+SRC_PATH_RE = re.compile(r"src/([A-Za-z0-9_.-]+)")
+SRCREV_LINE_RE = re.compile(
+    r'^(SRCREV(?:_[\w-]+)?)(\s*(?:\?=|=)\s*)"([0-9a-fA-F]{7,40})"',
+    re.MULTILINE,
+)
+NAME_PARAM_RE = re.compile(r"(?:^|;)\s*name=([A-Za-z0-9_.-]+)")
+META_JUDO_PATH_PREFIX = "oe/meta-judo"
 _SKILL_DIR = Path(__file__).resolve().parent
 _JUDO_ROOT = _SKILL_DIR.parents[3]
 
@@ -299,6 +311,26 @@ class PinResult:
         return True
 
 
+@dataclass(frozen=True)
+class RecipeSrcrevPin:
+    repo_name: str
+    recipe_rel: str
+    var_name: str
+    srcrev: str
+
+
+@dataclass
+class RecipeAlignResult:
+    project: ProjectPin
+    recipe: RecipeSrcrevPin
+    status: str
+    detail: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "ok"
+
+
 def load_pins(
     manifest_path: Path,
 ) -> tuple[dict[str, str], list[ProjectPin], int]:
@@ -335,6 +367,198 @@ def load_pins(
             )
         )
     return remotes, pins, skipped_non_hash
+
+
+def meta_judo_layer_dirs(workspace: Path, manifest_path: Path) -> list[Path]:
+    """Return checked-out oe/meta-judo* layer roots from the manifest."""
+    root = ET.parse(manifest_path).getroot()
+    layers: list[Path] = []
+    for node in root.findall("project"):
+        path = node.attrib.get("path", "")
+        if not path.startswith(META_JUDO_PATH_PREFIX):
+            continue
+        full = workspace / path
+        if full.is_dir():
+            layers.append(full.resolve())
+    return layers
+
+
+def recipe_references_repo(content: str, repo_name: str) -> bool:
+    for match in SRC_PATH_RE.finditer(content):
+        if match.group(1) == repo_name:
+            return True
+    return f"src/{repo_name}" in content
+
+
+def git_entries_for_repo(content: str, repo_name: str) -> list[str]:
+    entries: list[str] = []
+    for line in content.splitlines():
+        if f"src/{repo_name}" not in line:
+            continue
+        if "git://" in line or "GIT_URI" in line or "EXTERNALSRC" in line:
+            entries.append(line)
+    return entries
+
+
+def srcrev_var_names(content: str, repo_name: str) -> list[str]:
+    entries = git_entries_for_repo(content, repo_name)
+    if not entries:
+        return []
+
+    names: list[str] = []
+    for entry in entries:
+        name_match = NAME_PARAM_RE.search(entry)
+        if name_match:
+            names.append(f"SRCREV_{name_match.group(1)}")
+        elif "EXTERNALSRC" in entry or "GIT_URI" in entry:
+            names.append("SRCREV")
+        elif "git://" in entry:
+            names.append("SRCREV")
+
+    deduped: list[str] = []
+    for name in names:
+        if name not in deduped:
+            deduped.append(name)
+    return deduped
+
+
+def srcrev_vars_in_file(content: str) -> set[str]:
+    return {match.group(1) for match in SRCREV_LINE_RE.finditer(content)}
+
+
+def find_srcrev_targets(content: str, repo_name: str) -> list[str]:
+    candidates = srcrev_var_names(content, repo_name)
+    if not candidates:
+        return []
+    present = srcrev_vars_in_file(content)
+    resolved = [name for name in candidates if name in present]
+    return resolved
+
+
+def read_definite_srcrev(
+    content: str, repo_name: str
+) -> tuple[str, str] | None:
+    """Return (var_name, sha) for definitive SRCREV = pins, or None."""
+    targets = find_srcrev_targets(content, repo_name)
+    if not targets:
+        return None
+    if len(targets) > 1:
+        return None
+    var_name = targets[0]
+    for match in SRCREV_LINE_RE.finditer(content):
+        if match.group(1) != var_name:
+            continue
+        if "?=" in match.group(2):
+            return None
+        sha = match.group(3).lower()
+        if is_sha1_revision(sha):
+            return var_name, sha
+        return None
+    return None
+
+
+def discover_recipe_srcrev_pins(
+    layers: list[Path],
+    repo_name: str,
+    workspace: Path,
+) -> list[RecipeSrcrevPin]:
+    pins: list[RecipeSrcrevPin] = []
+    for layer in layers:
+        for path in layer.rglob("*"):
+            if path.suffix not in {".bb", ".inc"}:
+                continue
+            try:
+                content = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            if not recipe_references_repo(content, repo_name):
+                continue
+            pin = read_definite_srcrev(content, repo_name)
+            if pin is None:
+                continue
+            var_name, sha = pin
+            try:
+                rel = path.resolve().relative_to(workspace).as_posix()
+            except ValueError:
+                rel = str(path)
+            pins.append(
+                RecipeSrcrevPin(
+                    repo_name=repo_name,
+                    recipe_rel=rel,
+                    var_name=var_name,
+                    srcrev=sha,
+                )
+            )
+    return pins
+
+
+def check_recipe_manifest_alignment(
+    project: ProjectPin,
+    recipe: RecipeSrcrevPin,
+    workspace: Path,
+) -> RecipeAlignResult:
+    manifest_sha = project.revision.lower()
+    recipe_sha = recipe.srcrev.lower()
+    if manifest_sha != recipe_sha:
+        return RecipeAlignResult(
+            project,
+            recipe,
+            "mismatch",
+            (
+                f"manifest revision {manifest_sha[:12]}… != "
+                f"{recipe.var_name} {recipe_sha[:12]}… in "
+                f"{recipe.recipe_rel}"
+            ),
+        )
+
+    rel = Path(project.path)
+    checkout = workspace if rel == Path(".") else workspace / rel
+    if not is_git_dir(checkout):
+        return RecipeAlignResult(project, recipe, "ok", "")
+
+    if cat_file_commit(checkout, recipe_sha):
+        return RecipeAlignResult(project, recipe, "ok", "")
+
+    return RecipeAlignResult(
+        project,
+        recipe,
+        "unreachable",
+        (
+            f"{recipe.var_name} matches manifest but commit is not in "
+            f"checked-out {project.path} (repo sync / BitBake fetch would "
+            "fail)"
+        ),
+    )
+
+
+def check_all_recipe_alignments(
+    workspace: Path,
+    manifest_path: Path,
+    pins: list[ProjectPin],
+) -> list[RecipeAlignResult]:
+    layers = meta_judo_layer_dirs(workspace, manifest_path)
+    if not layers:
+        eprint(
+            "WARNING: no oe/meta-judo* layers found; skip recipe SRCREV checks"
+        )
+        return []
+
+    src_pins = [p for p in pins if p.path.startswith("src/")]
+    results: list[RecipeAlignResult] = []
+    for project in src_pins:
+        repo_name = project.name
+        recipe_pins = discover_recipe_srcrev_pins(
+            layers, repo_name, workspace
+        )
+        if not recipe_pins:
+            continue
+        for recipe in recipe_pins:
+            results.append(
+                check_recipe_manifest_alignment(
+                    project, recipe, workspace
+                )
+            )
+    return results
 
 
 def check_pin(
@@ -475,6 +699,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Only print failures and summary.",
     )
+    parser.add_argument(
+        "--skip-recipe",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Skip BitBake SRCREV vs manifest revision checks for src/* "
+            "SHA pins."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -488,9 +721,6 @@ def main(argv: list[str] | None = None) -> int:
 
     manifest_branch = manifest_git_branch(workspace, args.manifest_branch)
     remotes, pins, skipped_non_hash = load_pins(manifest)
-    if not pins:
-        print("No SHA1 revision pins found.")
-        return 0
 
     if not args.quiet and skipped_non_hash:
         print(
@@ -501,43 +731,85 @@ def main(argv: list[str] | None = None) -> int:
     if manifest_branch and not args.quiet:
         print(f"Manifest branch: {manifest_branch}\n")
 
-    results: list[PinResult] = []
-    for pin in pins:
-        results.append(
-            check_pin(
-                pin,
-                workspace,
-                remotes,
-                manifest_branch,
-                skip_remote=args.skip_remote,
-                skip_tip=args.skip_tip,
+    pin_results: list[PinResult] = []
+    pin_failures: list[PinResult] = []
+    if not pins:
+        print("No SHA1 revision pins found.")
+    else:
+        for pin in pins:
+            pin_results.append(
+                check_pin(
+                    pin,
+                    workspace,
+                    remotes,
+                    manifest_branch,
+                    skip_remote=args.skip_remote,
+                    skip_tip=args.skip_tip,
+                )
             )
+
+        pin_failures = [r for r in pin_results if not r.ok]
+        for res in pin_results:
+            if args.quiet and res.ok:
+                continue
+            p = res.pin
+            line = (
+                f"{p.name:28} {p.revision[:12]}…  "
+                f"local={res.local_status:16} origin={res.origin_status:8} "
+                f"branch={res.branch_status}"
+            )
+            if not res.ok:
+                line = f"FAIL {line}"
+            print(line)
+            if res.detail and (not args.quiet or not res.ok):
+                print(f"     {res.detail}")
+            if res.branch_detail and (not args.quiet or not res.ok):
+                print(f"     branch: {res.branch_detail}")
+            if res.origin_status == "missing" and (
+                not args.quiet or not res.ok
+            ):
+                print(f"     origin: {res.origin_url}")
+
+        print(
+            f"\nChecked {len(pin_results)} manifest pin(s): "
+            f"{len(pin_results) - len(pin_failures)} ok, "
+            f"{len(pin_failures)} failed."
         )
 
-    failures = [r for r in results if not r.ok]
-    for res in results:
-        if args.quiet and res.ok:
-            continue
-        p = res.pin
-        line = (
-            f"{p.name:28} {p.revision[:12]}…  "
-            f"local={res.local_status:16} origin={res.origin_status:8} "
-            f"branch={res.branch_status}"
+    recipe_results: list[RecipeAlignResult] = []
+    recipe_failures: list[RecipeAlignResult] = []
+    if not args.skip_recipe and pins:
+        if not args.quiet:
+            print("")
+        recipe_results = check_all_recipe_alignments(
+            workspace, manifest, pins
         )
-        if not res.ok:
-            line = f"FAIL {line}"
-        print(line)
-        if res.detail and (not args.quiet or not res.ok):
-            print(f"     {res.detail}")
-        if res.branch_detail and (not args.quiet or not res.ok):
-            print(f"     branch: {res.branch_detail}")
-        if res.origin_status == "missing" and (not args.quiet or not res.ok):
-            print(f"     origin: {res.origin_url}")
+        recipe_failures = [r for r in recipe_results if not r.ok]
+        for res in recipe_results:
+            if args.quiet and res.ok:
+                continue
+            p = res.project
+            r = res.recipe
+            line = (
+                f"{p.name:28} manifest={p.revision[:12]}…  "
+                f"recipe={r.srcrev[:12]}…  {r.recipe_rel}  "
+                f"status={res.status}"
+            )
+            if not res.ok:
+                line = f"FAIL {line}"
+            print(line)
+            if res.detail and (not args.quiet or not res.ok):
+                print(f"     {res.detail}")
 
-    print(
-        f"\nChecked {len(results)} pin(s): "
-        f"{len(results) - len(failures)} ok, {len(failures)} failed."
-    )
+        if recipe_results:
+            print(
+                f"\nChecked {len(recipe_results)} recipe SRCREV pin(s): "
+                f"{len(recipe_results) - len(recipe_failures)} ok, "
+                f"{len(recipe_failures)} failed."
+            )
+        elif not args.quiet and not args.skip_recipe:
+            print("No recipe SRCREV pins to compare for src/* SHA projects.")
+
     if args.skip_remote:
         print(
             "NOTE: --skip-remote; origin, branch tip, and alignment not "
@@ -545,7 +817,9 @@ def main(argv: list[str] | None = None) -> int:
         )
     elif args.skip_tip:
         print("NOTE: --skip-tip; pins may be behind origin branch tips.")
-    return 1 if failures else 0
+    if args.skip_recipe:
+        print("NOTE: --skip-recipe; manifest vs BitBake SRCREV not verified.")
+    return 1 if pin_failures or recipe_failures else 0
 
 
 if __name__ == "__main__":

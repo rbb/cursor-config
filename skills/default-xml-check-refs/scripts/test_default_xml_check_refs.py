@@ -70,5 +70,88 @@ class CheckRefsDoesNotShallow(unittest.TestCase):
             self.assertEqual(len(parents.split()), 2)
 
 
+class RecipeManifestAlignment(unittest.TestCase):
+    def test_mismatch_fails(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="recipe-align-") as raw:
+            root = Path(raw)
+            work = root / "work"
+            layer = work / "oe" / "meta-judo-proprietary"
+            recipe_dir = layer / "recipes-python" / "python3-foo"
+            recipe_dir.mkdir(parents=True)
+            manifest_sha = "a" * 40
+            recipe_sha = "b" * 40
+            (recipe_dir / "python3-foo_git.bb").write_text(
+                'SRCREV = "' + recipe_sha + '"\n'
+                'SRC_URI = "git://${TOPDIR}/../src/foo;protocol=file"\n',
+                encoding="utf-8",
+            )
+            manifest = work / "default.xml"
+            manifest.write_text(
+                '<?xml version="1.0" encoding="UTF-8"?>\n'
+                "<manifest>\n"
+                f'  <remote name="judo" fetch="{root}"/>\n'
+                '  <project name="meta-judo-proprietary" '
+                'path="oe/meta-judo-proprietary" remote="judo" '
+                f'revision="{"c" * 40}"/>\n'
+                '  <project name="foo" path="src/foo" remote="judo" '
+                f'revision="{manifest_sha}"/>\n'
+                "</manifest>\n",
+                encoding="utf-8",
+            )
+            results = check.check_all_recipe_alignments(
+                work, manifest, [
+                    check.ProjectPin(
+                        name="foo",
+                        path="src/foo",
+                        remote_name="judo",
+                        revision=manifest_sha,
+                    )
+                ],
+            )
+            self.assertEqual(len(results), 1)
+            self.assertFalse(results[0].ok)
+            self.assertEqual(results[0].status, "mismatch")
+
+    def test_match_ok_without_checkout(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="recipe-align-") as raw:
+            root = Path(raw)
+            work = root / "work"
+            layer = work / "oe" / "meta-judo"
+            recipe_dir = layer / "recipes" / "bar"
+            recipe_dir.mkdir(parents=True)
+            sha = "d" * 40
+            (recipe_dir / "bar_git.bb").write_text(
+                f'SRCREV = "{sha}"\n'
+                'SRC_URI = "git://${TOPDIR}/../src/bar;protocol=file"\n',
+                encoding="utf-8",
+            )
+            manifest = work / "default.xml"
+            manifest.write_text(
+                '<?xml version="1.0" encoding="UTF-8"?>\n'
+                "<manifest>\n"
+                f'  <remote name="judo" fetch="{root}"/>\n'
+                '  <project name="meta-judo" path="oe/meta-judo" '
+                f'remote="judo" revision="{"e" * 40}"/>\n'
+                '  <project name="bar" path="src/bar" remote="judo" '
+                f'revision="{sha}"/>\n'
+                "</manifest>\n",
+                encoding="utf-8",
+            )
+            results = check.check_all_recipe_alignments(
+                work,
+                manifest,
+                [
+                    check.ProjectPin(
+                        name="bar",
+                        path="src/bar",
+                        remote_name="judo",
+                        revision=sha,
+                    )
+                ],
+            )
+            self.assertEqual(len(results), 1)
+            self.assertTrue(results[0].ok)
+
+
 if __name__ == "__main__":
     unittest.main()
