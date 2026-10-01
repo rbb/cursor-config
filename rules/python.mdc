@@ -26,3 +26,14 @@ alwaysApply: false
   quotes (""").
 - For --xxx, --no-xxxx style options use BooleanOptionalAction. Default
   should be set to either True or False (depending on requested behavior).
+- Function parameters (definitions): Keep parameters in their natural,
+  stable order. Do not add a lone ``*,`` to force keyword-only arguments
+  when a normal list already works (required parameters, then parameters
+  with defaults). Do not reorder only to avoid ``*,`` or to change
+  calling style; fix awkward signatures at call sites instead. When new
+  required parameters are added to an existing function, reordering is
+  OK so every parameter with a default stays at the end of the list.
+- Function arguments (calls): Positional and keyword arguments may be
+  mixed. Pass positional arguments first, then keyword arguments, and
+  omit parameters that should keep their defaults (do not pass them
+  explicitly unless clarity requires it).
