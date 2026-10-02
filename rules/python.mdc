@@ -37,3 +37,10 @@ alwaysApply: false
   mixed. Pass positional arguments first, then keyword arguments, and
   omit parameters that should keep their defaults (do not pass them
   explicitly unless clarity requires it).
+
+# New Code
+
+When writing new code, prefer the following styles. It is OK for **existing**
+code to follow different patterns.
+- Use argparse.ArgumentDefaultsHelpFormatter with argparse.
+- Use BooleanOptionalAction when using argparse to specify boolean arguments.
