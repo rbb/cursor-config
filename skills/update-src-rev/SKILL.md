@@ -30,14 +30,14 @@ Pass `meta-judo` (or `oe/meta-judo`) directly.
 
 | Step | Git repo | Artifact |
 |------|----------|----------|
-| 1 | `oe/meta-judo*` | Matching branch + `SRCREV` commit |
+| 1 | `oe/meta-judo*` | Matching branches + all required `SRCREV` commits |
 | 2 | Manifest (workspace root) | Source `<project revision>` |
-| 3 | Manifest (workspace root) | Recipe-layer `<project revision>` |
+| 3 | Manifest (workspace root) | Every changed recipe-layer `<project revision>` |
 | 4 | Manifest (workspace root) | `manifest-judo` self `<project revision>` |
 
 Step 1 reads the source SHA from the source repo `HEAD` (or `--srcrev`).
-Step 3 uses the meta-layer `HEAD` **after** the recipe commit (or after
-checking out the matching branch if SRCREV already matched).
+Step 3 uses each changed meta-layer `HEAD` **after** its recipe commit (or
+after checking out the matching branch if its `SRCREV` already matched).
 
 Step 4 pins the `manifest-judo` project (path `.`) to the workspace
 branch name so `repo manifest -r` locks manifest scripts (e.g.
@@ -125,18 +125,34 @@ pin uses committed `HEAD`. **Tracked** uncommitted changes still require
 
 Recipe discovery prefers the canonical recipe when several `.bb` files
 reference the same `src/<name>` (for example
-`recipes-.../<name>/<name>_git.bb`). Pass `--recipe` when ambiguity
-remains.
+`recipes-.../<name>/<name>_git.bb`). It also inventories every other
+recipe that directly references the source. A definitive assignment
+(`SRCREV =`, not `SRCREV ?=`) is a release pin and must match the target
+source SHA. `SRCREV ?=` is an intentionally overrideable default and is
+reported but not updated.
 
-When the primary recipe is already pinned to source `HEAD`, the script
-also scans other recipes that reference the same `src/<name>`. Any that
-use a definitive assignment (`SRCREV =`, not `SRCREV ?=`) must match
-source `HEAD` as well. If they lag (for example
-`python3-functional-test_git.bb` while the canonical
-`judo-radio-utils_git.bb` was updated), the run **errors** and lists
-each stale recipe. Update them with `--recipe <path>` in separate runs,
-or pass `--allow-split-src-pins` when intentional lag is expected
-(recipes that only use `SRCREV ?=` are not checked).
+The helper updates one recipe per invocation. When more than one
+definitive pin needs to move, the agent must update **all** of them:
+
+1. Run the canonical recipe with `--allow-split-src-pins`; this is a
+   short-lived exception that permits the first layer to move while the
+   other layer pins are still old.
+2. Run each listed stale recipe with `--recipe <path>`, in the order
+   reported. Each invocation commits that recipe's layer and amends the
+   single manifest pin commit.
+3. Run the source-repo dry run again without
+   `--allow-split-src-pins`. It must report no split pins.
+
+Do not stop after the canonical recipe or use
+`--allow-split-src-pins` as a final state. The flag only enables the
+first invocation in the sequence.
+
+Not every `oe/meta-judo*` layer requires a change for every source
+release. A layer requires an SRCREV update only when it has a direct
+recipe pin. Separately inspect feature packaging and runtime
+dependencies in layers that build or install the feature; make and pin
+a layer change only when that inspection identifies a real packaging
+change. Do not create a no-op recipe change merely to pin a layer.
 
 After these checks, the script aligns the **meta-layer** and
 **workspace** (manifest) repos to the **source repo branch name**:
@@ -433,6 +449,18 @@ When the user wants this operation:
 3. Run `update_src_rev.py` with `-n` first; show the script output
    (pre-flight + three steps + final result + push hints) without
    rewriting the layout.
+   - Inspect every definitive split-pin path reported by the dry run.
+     Also inspect the relevant packagegroups, image recipes, and runtime
+     dependencies when the source change adds a package or executable.
+     A layer with no direct source pin only needs a separate update when
+     that inspection finds a packaging change.
+   - If the dry run reports stale definitive pins, record the canonical
+     recipe and every listed path. Do not present the error as a blocker
+     or ask the user to choose a recipe.
+   - Apply the canonical recipe with `--allow-split-src-pins`, then
+     apply each reported path with `--recipe <path>`. Re-run `-n`
+     without the flag after the final recipe; the run must have no split
+     pin warnings before reporting completion.
 4. If the script exits with **`PREFLIGHT: action required`** (exit
    code 2), use **AskQuestion**. For main **behind/missing**, offer
    `yes` (`--fix-preflight`), `abort`, or `continue`
@@ -485,7 +513,7 @@ retry blindly; inspect git state in both repos before re-running.
 | After `rebase-redo` | Manifest may be on `branch_b`; use `--recreate-branch` when aligning to `branch_a`. |
 | Detached HEAD | Check out a named branch first. |
 | Multiple recipes match | Auto-picks canonical `*_git.bb` when unique; else list paths and `--recipe`. |
-| Other `SRCREV =` recipes lag | Error with paths; update via `--recipe` or `--allow-split-src-pins`. |
+| Other `SRCREV =` recipes lag | Apply canonical with `--allow-split-src-pins`, then each listed `--recipe <path>`; final dry run must have no split pins. |
 | After meta-layer rebase | Re-run skill to refresh step 3 manifest pin. |
 | No issue in branch name | Ask for issue id or pass `--issue`. |
 | SRCREV already matches | Skip recipe commit; still do branch + XML. |
