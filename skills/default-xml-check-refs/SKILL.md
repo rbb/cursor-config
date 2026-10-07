@@ -4,10 +4,10 @@ description: >-
   Verifies 40-character SHA1 revision pins in default.xml exist locally and on
   origin; for those pins only, checks alignment with the manifest git branch
   when that branch exists on the project remote (pin must equal branch tip).
-  For src/* SHA pins, compares manifest revision to BitBake SRCREV = in
-  oe/meta-judo* recipes. Ignores non-hash revisions (main, master, tags,
-  etc.) for manifest ref checks. Use after update-src-rev, before pushing
-  manifest changes, or for /default-xml-check-refs.
+  For src/* SHA pins, compares manifest revision to URI-associated BitBake
+  SRCREV values in oe/meta-judo* recipes. Ignores non-hash revisions (main,
+  master, tags, etc.) for manifest ref checks. Use after update-src-rev,
+  before pushing manifest changes, or for /default-xml-check-refs.
 disable-model-invocation: true
 ---
 
@@ -45,6 +45,7 @@ Run from manifest-judo root (or pass `--workspace`).
 | `--skip-tip` | Pin may be behind `origin/{manifest-branch}` tip |
 | `--no-skip-tip` | Default: pin must equal branch tip when branch exists |
 | `--skip-recipe` | Skip manifest vs BitBake `SRCREV` checks |
+| `--lenient-optional-src-pins` | Report stale `SRCREV ?=` pins without failing |
 | `-q` / `--quiet` | Print failures and summary only |
 
 Exit **0** when every SHA pin passes; **1** when any check fails.
@@ -80,11 +81,17 @@ Non-hash revisions are not listed in the report.
 
 - Layers: checked-out manifest projects under `oe/meta-judo*`.
 - Projects: `src/*` with a 40-character manifest `revision`.
-- Recipes: `*.bb` / `*.inc` referencing `src/<name>` with a definitive
-  `SRCREV = "…"` (not `SRCREV ?=`).
-- Fail when manifest `revision` ≠ recipe `SRCREV`, or when they match but
-  the commit is absent from a checked-out `src/<name>` tree (BitBake
-  `do_fetch` / `repo sync` failure).
+- Recipes: `*.bb` / `*.inc` with an in-tree `protocol=file` URI for
+  `src/<name>`. An unnamed URI maps to `SRCREV`; `;name=foo` maps to
+  `SRCREV_foo`.
+- Check both `SRCREV = "…"` and `SRCREV ?= "…"`. A stale optional pin fails
+  as `optional_srcrev_stale` unless `--lenient-optional-src-pins` is used.
+- A source URI whose pin is assigned only through a colon override reports
+  `override_srcrev_unresolved`; the checker does not guess BitBake override
+  precedence.
+- Fail when manifest `revision` differs from the URI-associated `SRCREV`, or
+  when they match but the commit is absent from a checked-out `src/<name>`
+  tree (BitBake `do_fetch` / `repo sync` failure).
 
 Manifest URL rule: `{fetch}/{name}.git`.
 

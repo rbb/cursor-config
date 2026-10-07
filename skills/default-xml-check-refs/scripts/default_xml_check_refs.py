@@ -10,9 +10,8 @@ with the same name. When that branch exists, the pin must equal the branch
 tip on origin (not merely be an ancestor).
 
 For src/* projects with SHA pins, scans oe/meta-judo* BitBake recipes
-that reference ``src/<name>`` and requires definitive ``SRCREV =``
-values to match the manifest revision (and to exist in a checked-out
-source tree when present).
+that reference ``src/<name>`` through an in-tree ``protocol=file`` URI
+and requires their associated ``SRCREV`` values to match the manifest.
 """
 
 from __future__ import annotations
@@ -30,7 +29,11 @@ from pathlib import Path
 SHA1_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 SRC_PATH_RE = re.compile(r"src/([A-Za-z0-9_.-]+)")
 SRCREV_LINE_RE = re.compile(
-    r'^(SRCREV(?:_[\w-]+)?)(\s*(?:\?=|=)\s*)"([0-9a-fA-F]{7,40})"',
+    r'^(SRCREV(?:_[\w-]+)?)(\s*(\?=|=)\s*)"([0-9a-fA-F]{7,40})"',
+    re.MULTILINE,
+)
+OVERRIDE_SRCREV_RE = re.compile(
+    r'^(SRCREV(?:_[\w-]+)?):[\w-]+(?:\s*(?:\?=|=)\s*)".*"',
     re.MULTILINE,
 )
 NAME_PARAM_RE = re.compile(r"(?:^|;)\s*name=([A-Za-z0-9_.-]+)")
@@ -317,6 +320,7 @@ class RecipeSrcrevPin:
     recipe_rel: str
     var_name: str
     srcrev: str
+    operator: str
 
 
 @dataclass
@@ -390,18 +394,20 @@ def recipe_references_repo(content: str, repo_name: str) -> bool:
     return f"src/{repo_name}" in content
 
 
-def git_entries_for_repo(content: str, repo_name: str) -> list[str]:
+def file_uri_entries_for_repo(content: str, repo_name: str) -> list[str]:
+    """Return URI lines for in-tree file-protocol sources of one repo."""
     entries: list[str] = []
     for line in content.splitlines():
         if f"src/{repo_name}" not in line:
             continue
-        if "git://" in line or "GIT_URI" in line or "EXTERNALSRC" in line:
+        if "protocol=file" in line:
             entries.append(line)
     return entries
 
 
-def srcrev_var_names(content: str, repo_name: str) -> list[str]:
-    entries = git_entries_for_repo(content, repo_name)
+def uri_srcrev_var_names(content: str, repo_name: str) -> list[str]:
+    """Map matching file URIs to their BitBake SRCREV variable names."""
+    entries = file_uri_entries_for_repo(content, repo_name)
     if not entries:
         return []
 
@@ -427,7 +433,7 @@ def srcrev_vars_in_file(content: str) -> set[str]:
 
 
 def find_srcrev_targets(content: str, repo_name: str) -> list[str]:
-    candidates = srcrev_var_names(content, repo_name)
+    candidates = uri_srcrev_var_names(content, repo_name)
     if not candidates:
         return []
     present = srcrev_vars_in_file(content)
@@ -435,24 +441,30 @@ def find_srcrev_targets(content: str, repo_name: str) -> list[str]:
     return resolved
 
 
-def read_definite_srcrev(
+def read_uri_srcrev(
     content: str, repo_name: str
-) -> tuple[str, str] | None:
-    """Return (var_name, sha) for definitive SRCREV = pins, or None."""
+) -> tuple[str, str, str] | tuple[str, str] | None:
+    """Return a URI-associated ``(var, sha, operator)`` or a diagnostic."""
     targets = find_srcrev_targets(content, repo_name)
     if not targets:
+        candidates = uri_srcrev_var_names(content, repo_name)
+        for candidate in candidates:
+            if re.search(
+                rf"^{re.escape(candidate)}:[\w-]+(?:\s*(?:\?=|=)\s*)",
+                content,
+                re.MULTILINE,
+            ):
+                return candidate, "override_srcrev_unresolved"
         return None
     if len(targets) > 1:
-        return None
+        return targets[0], "override_srcrev_unresolved"
     var_name = targets[0]
     for match in SRCREV_LINE_RE.finditer(content):
         if match.group(1) != var_name:
             continue
-        if "?=" in match.group(2):
-            return None
-        sha = match.group(3).lower()
+        sha = match.group(4).lower()
         if is_sha1_revision(sha):
-            return var_name, sha
+            return var_name, sha, match.group(3)
         return None
     return None
 
@@ -473,10 +485,22 @@ def discover_recipe_srcrev_pins(
                 continue
             if not recipe_references_repo(content, repo_name):
                 continue
-            pin = read_definite_srcrev(content, repo_name)
+            pin = read_uri_srcrev(content, repo_name)
             if pin is None:
                 continue
-            var_name, sha = pin
+            if len(pin) == 2:
+                var_name, diagnostic = pin
+                pins.append(
+                    RecipeSrcrevPin(
+                        repo_name=repo_name,
+                        recipe_rel=recipe_display_path(path, workspace),
+                        var_name=var_name,
+                        srcrev="",
+                        operator=diagnostic,
+                    )
+                )
+                continue
+            var_name, sha, operator = pin
             try:
                 rel = path.resolve().relative_to(workspace).as_posix()
             except ValueError:
@@ -487,6 +511,7 @@ def discover_recipe_srcrev_pins(
                     recipe_rel=rel,
                     var_name=var_name,
                     srcrev=sha,
+                    operator=operator,
                 )
             )
     return pins
@@ -497,13 +522,27 @@ def check_recipe_manifest_alignment(
     recipe: RecipeSrcrevPin,
     workspace: Path,
 ) -> RecipeAlignResult:
+    if recipe.operator == "override_srcrev_unresolved":
+        return RecipeAlignResult(
+            project,
+            recipe,
+            "override_srcrev_unresolved",
+            (
+                f"{recipe.var_name} for in-tree src/{project.name} is "
+                "assigned only through a colon override"
+            ),
+        )
     manifest_sha = project.revision.lower()
     recipe_sha = recipe.srcrev.lower()
     if manifest_sha != recipe_sha:
         return RecipeAlignResult(
             project,
             recipe,
-            "mismatch",
+            (
+                "optional_srcrev_stale"
+                if recipe.operator == "?="
+                else "mismatch"
+            ),
             (
                 f"manifest revision {manifest_sha[:12]}… != "
                 f"{recipe.var_name} {recipe_sha[:12]}… in "
@@ -529,6 +568,14 @@ def check_recipe_manifest_alignment(
             "fail)"
         ),
     )
+
+
+def recipe_display_path(path: Path, workspace: Path) -> str:
+    """Return a recipe path relative to the checked-out workspace."""
+    try:
+        return path.resolve().relative_to(workspace).as_posix()
+    except ValueError:
+        return str(path)
 
 
 def check_all_recipe_alignments(
@@ -559,6 +606,22 @@ def check_all_recipe_alignments(
                 )
             )
     return results
+
+
+def recipe_alignment_failures(
+    results: list[RecipeAlignResult],
+    lenient_optional: bool,
+) -> list[RecipeAlignResult]:
+    """Return failing recipe results under the selected optional-pin policy."""
+    return [
+        result
+        for result in results
+        if not result.ok
+        and not (
+            lenient_optional
+            and result.status == "optional_srcrev_stale"
+        )
+    ]
 
 
 def check_pin(
@@ -708,6 +771,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "SHA pins."
         ),
     )
+    parser.add_argument(
+        "--lenient-optional-src-pins",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Report stale SRCREV ?= pins without failing the check "
+            "(default: False)."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -784,7 +856,9 @@ def main(argv: list[str] | None = None) -> int:
         recipe_results = check_all_recipe_alignments(
             workspace, manifest, pins
         )
-        recipe_failures = [r for r in recipe_results if not r.ok]
+        recipe_failures = recipe_alignment_failures(
+            recipe_results, args.lenient_optional_src_pins
+        )
         for res in recipe_results:
             if args.quiet and res.ok:
                 continue

@@ -71,6 +71,28 @@ class CheckRefsDoesNotShallow(unittest.TestCase):
 
 
 class RecipeManifestAlignment(unittest.TestCase):
+    def recipe_result(
+        self,
+        content: str,
+        manifest_sha: str = "a" * 40,
+    ) -> check.RecipeAlignResult:
+        with tempfile.TemporaryDirectory(prefix="recipe-align-") as raw:
+            root = Path(raw)
+            work = root / "work"
+            recipe = work / "oe" / "meta-judo" / "recipes" / "foo.bb"
+            recipe.parent.mkdir(parents=True)
+            recipe.write_text(content, encoding="utf-8")
+            pins = check.discover_recipe_srcrev_pins(
+                [recipe.parents[2]], "foo", work
+            )
+            self.assertEqual(len(pins), 1)
+            project = check.ProjectPin(
+                "foo", "src/foo", "judo", manifest_sha
+            )
+            return check.check_recipe_manifest_alignment(
+                project, pins[0], work
+            )
+
     def test_mismatch_fails(self) -> None:
         with tempfile.TemporaryDirectory(prefix="recipe-align-") as raw:
             root = Path(raw)
@@ -151,6 +173,57 @@ class RecipeManifestAlignment(unittest.TestCase):
             )
             self.assertEqual(len(results), 1)
             self.assertTrue(results[0].ok)
+
+    def test_optional_srcrev_stale_fails_by_default(self) -> None:
+        result = self.recipe_result(
+            'SRC_URI = "git://${TOPDIR}/../src/foo;protocol=file"\n'
+            f'SRCREV ?= "{"b" * 40}"\n'
+        )
+        self.assertEqual(result.status, "optional_srcrev_stale")
+        self.assertEqual(
+            check.recipe_alignment_failures([result], False), [result]
+        )
+        self.assertEqual(check.recipe_alignment_failures([result], True), [])
+
+    def test_named_uri_ignores_unrelated_srcrev(self) -> None:
+        sha = "a" * 40
+        result = self.recipe_result(
+            'SRC_URI = "git://${TOPDIR}/../src/foo;protocol=file;name=foo"\n'
+            f'SRCREV = "{"b" * 40}"\n'
+            f'SRCREV_foo = "{sha}"\n',
+            sha,
+        )
+        self.assertTrue(result.ok)
+
+    def test_colon_override_is_reported_as_unresolved(self) -> None:
+        result = self.recipe_result(
+            'SRC_URI = "git://${TOPDIR}/../src/foo;protocol=file"\n'
+            f'SRCREV:machine = "{"a" * 40}"\n'
+        )
+        self.assertEqual(result.status, "override_srcrev_unresolved")
+
+    def test_multiple_layers_and_mixed_operators_are_discovered(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="recipe-align-") as raw:
+            work = Path(raw) / "work"
+            sha = "a" * 40
+            for layer, operator in (
+                ("meta-judo", "="),
+                ("meta-judo-proprietary", "?="),
+            ):
+                recipe = work / "oe" / layer / "recipes" / "foo.bb"
+                recipe.parent.mkdir(parents=True)
+                recipe.write_text(
+                    'SRC_URI = "git://${TOPDIR}/../src/foo;protocol=file"\n'
+                    f'SRCREV {operator} "{sha}"\n',
+                    encoding="utf-8",
+                )
+            pins = check.discover_recipe_srcrev_pins(
+                sorted((work / "oe").glob("meta-judo*")), "foo", work
+            )
+            self.assertEqual(
+                [(pin.operator, pin.srcrev) for pin in pins],
+                [("=", sha), ("?=", sha)],
+            )
 
 
 if __name__ == "__main__":
