@@ -55,6 +55,10 @@ SRCREV_LINE_RE = re.compile(
     r'^(SRCREV(?:_[\w-]+)?)(\s*(?:\?=|=)\s*)"([0-9a-fA-F]{7,40})"',
     re.MULTILINE,
 )
+OVERRIDE_SRCREV_RE = re.compile(
+    r'^(SRCREV(?:_[\w-]+)?):[\w-]+(?:\s*(?:\?=|=)\s*)".*"',
+    re.MULTILINE,
+)
 NAME_PARAM_RE = re.compile(r"(?:^|;)\s*name=([A-Za-z0-9_.-]+)")
 ATTR_NAME = re.compile(r'\bname="([^"]*)"')
 ATTR_PATH = re.compile(r'\bpath="([^"]*)"')
@@ -1153,11 +1157,12 @@ def recipe_references_repo(content: str, repo_name: str) -> bool:
 
 
 def git_entries_for_repo(content: str, repo_name: str) -> list[str]:
+    """Return in-tree file-protocol URI lines for one source repository."""
     entries: list[str] = []
     for line in content.splitlines():
         if f"src/{repo_name}" not in line:
             continue
-        if "git://" in line or "GIT_URI" in line or "EXTERNALSRC" in line:
+        if "protocol=file" in line:
             entries.append(line)
     return entries
 
@@ -1172,9 +1177,7 @@ def srcrev_var_names(content: str, repo_name: str) -> list[str]:
         name_match = NAME_PARAM_RE.search(entry)
         if name_match:
             names.append(f"SRCREV_{name_match.group(1)}")
-        elif "EXTERNALSRC" in entry or "GIT_URI" in entry:
-            names.append("SRCREV")
-        elif "git://" in entry:
+        else:
             names.append("SRCREV")
 
     deduped: list[str] = []
@@ -1283,6 +1286,60 @@ def collect_recipe_pins(
         if pin is not None:
             pins.append(pin)
     return pins
+
+
+def stale_recipe_pins(
+    layers: list[Path],
+    repo_name: str,
+    workspace: Path,
+    target_srcrev: str,
+) -> list[RecipePin]:
+    """Return every URI-associated recipe pin that differs from target."""
+    return [
+        pin
+        for pin in collect_recipe_pins(layers, repo_name, workspace)
+        if pin.srcrev != target_srcrev
+    ]
+
+
+def unresolved_override_recipes(
+    layers: list[Path],
+    repo_name: str,
+    workspace: Path,
+) -> list[str]:
+    """List URI consumers whose matching SRCREV is only colon-overridden."""
+    unresolved: list[str] = []
+    for layer in layers:
+        for path in layer.rglob("*"):
+            if path.suffix not in {".bb", ".inc"}:
+                continue
+            try:
+                content = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            candidates = srcrev_var_names(content, repo_name)
+            if not candidates or find_srcrev_targets(content, repo_name):
+                continue
+            for name in candidates:
+                if re.search(
+                    rf"^{re.escape(name)}:[\w-]+(?:\s*(?:\?=|=)\s*)",
+                    content,
+                    re.MULTILINE,
+                ):
+                    unresolved.append(recipe_display_path(path, workspace))
+                    break
+    return unresolved
+
+
+def group_recipe_pins_by_layer(
+    pins: list[RecipePin],
+) -> dict[Path, list[RecipePin]]:
+    """Group recipe consumers by their containing meta-layer repository."""
+    grouped: dict[Path, list[RecipePin]] = {}
+    for pin in pins:
+        layer = meta_repo_for_recipe(pin.path)
+        grouped.setdefault(layer, []).append(pin)
+    return grouped
 
 
 def definite_src_pin_mismatches(
@@ -1597,6 +1654,122 @@ def update_recipe(
     result.meta_head = meta_head
     result.outcome = f"{kind} {var_name} {old_rev} -> {srcrev}"
     return result
+
+
+def update_recipe_pin(
+    args: argparse.Namespace,
+    workspace: Path,
+    src_repo: Path,
+    pin: RecipePin,
+    target_srcrev: str,
+    dry_run: bool,
+) -> RecipeResult:
+    """Update one discovered consumer; callers group commits by layer."""
+    recipe = pin.path
+    content = recipe.read_text(encoding="utf-8")
+    require_commit_in_source(src_repo, pin.srcrev)
+    meta_repo = meta_repo_for_recipe(recipe)
+    src_branch = source_branch_name(src_repo)
+    result = RecipeResult(
+        src_rel=recipe_display_path(src_repo, workspace),
+        src_branch=src_branch,
+        srcrev=target_srcrev,
+        recipe_path=pin.rel,
+        meta_rel=recipe_display_path(meta_repo, workspace),
+        meta_head=run_git(["rev-parse", "HEAD"], meta_repo),
+        meta_note="already on matching branch",
+        var_name=pin.var_name,
+        old_rev=pin.srcrev,
+        changed=pin.srcrev != target_srcrev,
+        outcome="",
+        issue=args.issue or extract_issue(recipe.parent, src_repo),
+    )
+    if not result.changed:
+        result.outcome = "SRCREV already matches source HEAD"
+        return result
+    updated, changed = replace_srcrev(content, pin.var_name, target_srcrev)
+    if not changed:
+        raise SystemExit(
+            f"ERROR: failed to update {pin.var_name} in {pin.rel}"
+        )
+    if dry_run:
+        result.outcome = (
+            f"would update {pin.var_name} {pin.srcrev} -> {target_srcrev}"
+        )
+        return result
+    recipe.write_text(updated, encoding="utf-8")
+    if args.no_commit:
+        result.outcome = f"updated {pin.var_name}; did not commit"
+    else:
+        if not result.issue:
+            raise SystemExit(
+                "ERROR: could not parse issue id from branch name; pass --issue"
+            )
+        kind = commit_recipe(recipe, result.issue, recipe_display_name(recipe))
+        result.outcome = f"{kind} {pin.var_name} {pin.srcrev} -> {target_srcrev}"
+    result.meta_head = run_git(["rev-parse", "HEAD"], meta_repo)
+    return result
+
+
+def preflight_recipe_layers(
+    ctx: SkillContext,
+    layers: list[Path],
+    args: argparse.Namespace,
+    dry_run: bool,
+) -> None:
+    """Align every layer with a stale consumer before any recipe is written."""
+    additional = [layer for layer in layers if layer != ctx.meta_repo]
+    if not additional:
+        return
+    handle_main_sync_problems(
+        [("Meta layer", layer) for layer in additional],
+        args,
+        dry_run,
+        [],
+    )
+    for layer in additional:
+        rel = recipe_display_path(layer, ctx.workspace)
+        current = current_branch(layer)
+        if not current:
+            raise SystemExit(
+                f"ERROR: Meta layer ({rel}) is on detached HEAD"
+            )
+        if current != ctx.src_branch:
+            if repo_has_tracked_changes(layer):
+                preflight_exit(
+                    [
+                        (
+                            f"Meta layer ({rel}) needs branch "
+                            f"{ctx.src_branch} but has tracked changes."
+                        ),
+                        "Commit or stash changes, then re-run the skill.",
+                    ]
+                )
+            check_branch_divergence(
+                layer, "Meta layer", rel, current, ctx.src_branch, args
+            )
+            if needs_branch_base_choice(
+                layer, ctx.src_branch, args.base_existing
+            ):
+                preflight_exit(
+                    [
+                        (
+                            f"Meta layer ({rel}) has no "
+                            f"{ctx.src_branch} branch."
+                        ),
+                        (
+                            "Re-run normally to branch from main, or pass "
+                            "--base-existing to branch from the checkout."
+                        ),
+                    ]
+                )
+        branch_alignment_plan(
+            layer,
+            ctx.src_branch,
+            args.base_existing,
+            dry_run,
+            recreate_branch=args.recreate_branch,
+        )
 
 
 # --- manifest ---
@@ -2695,6 +2868,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--only-canonical",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Update only the selected canonical recipe and report skipped "
+            "consumers (default: False)."
+        ),
+    )
+    parser.add_argument(
         "-n",
         "--dry-run",
         action="store_true",
@@ -2818,18 +3000,135 @@ def process_meta_layer_repo(
     return 0
 
 
-def process_repo(
-    repo_name: str,
+def process_all_source_consumers(
+    ctx: SkillContext,
     args: argparse.Namespace,
     workspace: Path,
     manifest: Path,
 ) -> int:
-    """Run the full skill (dry-run gate, then apply) for one repo arg."""
-    args.repo = repo_name
-    ctx = resolve_skill_context(args, workspace, manifest)
-    if ctx.meta_layer_only:
-        return process_meta_layer_repo(ctx, args, workspace, manifest)
+    """Synchronize every stale in-tree consumer and all affected layer pins."""
+    assert ctx.src_repo is not None
+    target = args.srcrev or run_git(["rev-parse", "HEAD"], ctx.src_repo)
+    layers = meta_layer_roots(workspace)
+    unresolved = unresolved_override_recipes(
+        layers, ctx.src_repo.name, workspace
+    )
+    if unresolved:
+        listing = "\n".join(f"  - {path}" for path in unresolved)
+        raise SystemExit(
+            "ERROR: override_srcrev_unresolved for in-tree source "
+            f"src/{ctx.src_repo.name}:\n{listing}"
+        )
+    stale = stale_recipe_pins(layers, ctx.src_repo.name, workspace, target)
+    if args.recipe:
+        requested = resolve_recipe(layers, ctx.src_repo.name, args.recipe, workspace)
+        stale = [pin for pin in stale if pin.path == requested.resolve()]
+    if not stale:
+        return process_repo_legacy(ctx, args, workspace, manifest)
 
+    affected_layers = list(group_recipe_pins_by_layer(stale))
+    preflight = run_preflight(ctx, args, dry_run=True)
+    preflight_recipe_layers(ctx, affected_layers, args, dry_run=True)
+    planned = [
+        update_recipe_pin(
+            args, workspace, ctx.src_repo, pin, target, dry_run=True
+        )
+        for pin in stale
+    ]
+    source_pin = update_manifest_pin(
+        workspace, manifest, ctx.src_rel, target, dry_run=True
+    )
+    layer_pins = [
+        update_manifest_pin(
+            workspace,
+            manifest,
+            recipe_display_path(layer, workspace),
+            run_git(["rev-parse", "HEAD"], layer),
+            dry_run=True,
+        )
+        for layer in affected_layers
+    ]
+    self_pin = sync_manifest_self_pin(
+        workspace, manifest, ctx.src_branch, dry_run=True
+    )
+    primary = planned[0]
+    primary.split_pin_mismatches = [
+        f"{item.recipe_path}: {item.var_name}={item.old_rev}"
+        for item in planned[1:]
+    ]
+    if args.dry_run:
+        print_preflight(preflight)
+        print_report(
+            primary, source_pin, layer_pins[0], self_pin, dry_run=True
+        )
+        if len(planned) > 1:
+            print(
+                f"Additional stale consumers: {len(planned) - 1} "
+                "(all would be updated)."
+            )
+        return 0
+
+    run_preflight(ctx, args, dry_run=False)
+    preflight_recipe_layers(ctx, affected_layers, args, dry_run=False)
+    applied: list[str] = []
+    completed: list[RecipeResult] = []
+    try:
+        for pin in stale:
+            completed.append(
+                update_recipe_pin(
+                    args, workspace, ctx.src_repo, pin, target, dry_run=False
+                )
+            )
+        applied.append("recipe SRCREV commits")
+        source_pin = update_manifest_pin(
+            workspace, manifest, ctx.src_rel, target, dry_run=False
+        )
+        applied.append("manifest source project")
+        layer_pins = [
+            update_manifest_pin(
+                workspace,
+                manifest,
+                recipe_display_path(layer, workspace),
+                run_git(["rev-parse", "HEAD"], layer),
+                dry_run=False,
+            )
+            for layer in affected_layers
+        ]
+        applied.append("manifest meta-layer projects")
+        self_pin = sync_manifest_self_pin(
+            workspace, manifest, ctx.src_branch, dry_run=False
+        )
+        applied.append("manifest self project")
+    except SystemExit as exc:
+        eprint(
+            "ERROR: partial apply; completed steps: "
+            + (", ".join(applied) or "none")
+        )
+        return exc.code if isinstance(exc.code, int) and exc.code else 1
+
+    primary = completed[0]
+    if not args.no_commit:
+        commit_manifest_bundle(
+            args, workspace, primary, [source_pin, *layer_pins], self_pin
+        )
+        applied.append("manifest commit")
+    print_preflight(preflight)
+    print_report(
+        primary, source_pin, layer_pins[0], self_pin,
+        dry_run=False, applied=applied,
+    )
+    if len(completed) > 1:
+        print(f"Additional synchronized consumers: {len(completed) - 1}.")
+    return 0
+
+
+def process_repo_legacy(
+    ctx: SkillContext,
+    args: argparse.Namespace,
+    workspace: Path,
+    manifest: Path,
+) -> int:
+    """Original single-consumer flow used by --only-canonical."""
     preflight = run_preflight(ctx, args, dry_run=True)
 
     recipe = update_recipe(
@@ -2837,21 +3136,29 @@ def process_repo(
     )
     chosen_recipe = (workspace / recipe.recipe_path).resolve()
     src_repo, _ = resolve_repos(args.repo, Path.cwd(), workspace)
-    split_notes = check_definite_src_pin_consistency(
-        args,
-        workspace,
-        src_repo.name,
-        chosen_recipe,
-        recipe.srcrev,
-        recipe.old_rev,
-    )
+    if args.only_canonical:
+        split_notes = [
+            (
+                "Other source consumers are intentionally skipped by "
+                "--only-canonical."
+            )
+        ]
+    else:
+        split_notes = check_definite_src_pin_consistency(
+            args,
+            workspace,
+            src_repo.name,
+            chosen_recipe,
+            recipe.srcrev,
+            recipe.old_rev,
+        )
     recipe.split_pin_mismatches = split_notes
     if split_notes:
         preflight.warnings.extend(split_notes)
     source_pin = update_manifest_pin(
         workspace,
         manifest,
-        repo_name,
+        args.repo,
         args.srcrev,
         dry_run=True,
     )
@@ -2891,7 +3198,7 @@ def process_repo(
         source_pin = update_manifest_pin(
             workspace,
             manifest,
-            repo_name,
+            args.repo,
             args.srcrev,
             dry_run=False,
         )
@@ -2954,6 +3261,42 @@ def process_repo(
     )
     print_pushes(push_hints)
     return 0
+
+
+def process_repo(
+    repo_name: str,
+    args: argparse.Namespace,
+    workspace: Path,
+    manifest: Path,
+) -> int:
+    """Run the full skill (dry-run gate, then apply) for one repo arg."""
+    args.repo = repo_name
+    ctx = resolve_skill_context(args, workspace, manifest)
+    if ctx.meta_layer_only:
+        return process_meta_layer_repo(ctx, args, workspace, manifest)
+    if args.only_canonical:
+        assert ctx.src_repo is not None
+        target = args.srcrev or run_git(["rev-parse", "HEAD"], ctx.src_repo)
+        layers = meta_layer_roots(workspace)
+        selected = resolve_recipe(
+            layers, ctx.src_repo.name, args.recipe, workspace
+        ).resolve()
+        skipped = [
+            pin
+            for pin in stale_recipe_pins(
+                layers, ctx.src_repo.name, workspace, target
+            )
+            if pin.path != selected
+        ]
+        code = process_repo_legacy(ctx, args, workspace, manifest)
+        if code == 0 and skipped:
+            print("Skipped stale consumers (--only-canonical)")
+            print()
+            for pin in skipped:
+                print(f"  - {pin.rel}: {pin.var_name}={pin.srcrev}")
+            print()
+        return code
+    return process_all_source_consumers(ctx, args, workspace, manifest)
 
 
 def main() -> int:
