@@ -67,6 +67,10 @@ MANIFEST_JUDO_NAME = "manifest-judo"
 MANIFEST_JUDO_PATH = "."
 
 
+def is_manifest_only_meta_layer(layer_name: str) -> bool:
+    return layer_name.startswith("meta-judo") or layer_name == "meta-bedrock"
+
+
 @dataclass
 class PushHint:
     rel: str
@@ -985,9 +989,10 @@ def resolve_repo_target(
         if meta_hint:
             if not is_git_repo(meta_hint):
                 raise SystemExit(f"ERROR: not a git repo: {meta_hint}")
-            if not meta_hint.name.startswith("meta-judo"):
+            if not is_manifest_only_meta_layer(meta_hint.name):
                 raise SystemExit(
-                    f"ERROR: oe repo must be a meta-judo* layer: {meta_hint}"
+                    f"ERROR: oe repo must be a manifest-only meta layer "
+                    f"(meta-judo* or meta-bedrock): {meta_hint}"
                 )
             layers = [meta_hint]
         else:
@@ -997,9 +1002,10 @@ def resolve_repo_target(
     if meta_hint:
         if not is_git_repo(meta_hint):
             raise SystemExit(f"ERROR: not a git repo: {meta_hint}")
-        if not meta_hint.name.startswith("meta-judo"):
+        if not is_manifest_only_meta_layer(meta_hint.name):
             raise SystemExit(
-                f"ERROR: oe repo {meta_hint.name!r} is not a meta-judo* layer"
+                f"ERROR: oe repo {meta_hint.name!r} is not a manifest-only "
+                "meta layer (meta-judo* or meta-bedrock)"
             )
         return RepoTarget("meta_layer", None, meta_hint, [meta_hint])
 
@@ -1091,9 +1097,10 @@ def parse_repo_arg(
     if src_exists:
         return src_candidate, None
     if oe_exists:
-        if not raw.startswith("meta-judo"):
+        if not is_manifest_only_meta_layer(raw):
             raise SystemExit(
-                f"ERROR: oe repo {raw!r} is not a meta-judo* layer"
+                f"ERROR: oe repo {raw!r} is not a manifest-only meta layer "
+                "(meta-judo* or meta-bedrock)"
             )
         return None, oe_candidate
 
@@ -1117,7 +1124,9 @@ def infer_from_cwd(cwd: Path, workspace: Path) -> tuple[Path | None, Path | None
         if is_git_repo(src_repo):
             return src_repo, None
 
-    if len(parts) >= 2 and parts[0] == "oe" and parts[1].startswith("meta-judo"):
+    if len(parts) >= 2 and parts[0] == "oe" and is_manifest_only_meta_layer(
+        parts[1]
+    ):
         meta_layer = workspace / "oe" / parts[1]
         if is_git_repo(meta_layer):
             return None, meta_layer
